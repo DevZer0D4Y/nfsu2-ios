@@ -30,6 +30,11 @@ if(NOT EXISTS "${NFSU2_GEN_DIR}/recomp_funcs.h")
                         "with --gen-dir, or pass -DNFSU2_GEN_DIR=<dir>.")
 endif()
 
+# The Vulkan renderer (xboxrecomp nv2a_vk) instead of OpenGL. On the Switch it
+# links mesa-switch's static NVK (NVK_SDK) and builds nfsu2x-vulkan.nro.
+option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
+set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
+
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${NFSU2_GEN_DIR}/*.c")
@@ -38,6 +43,7 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/switch_nx.c
+    src/text_patch.c
 )
 
 if(WIN32)
@@ -47,6 +53,27 @@ else()
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
+
+# Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
+# (src/movie_vp6.c). NFSU2_FFMPEG_DIR is an install of the minimal LGPL
+# build from tools/build_ffmpeg_vp6.sh (libavcodec with only the vp6
+# decoder); without it the lifted decoder plays the movies.
+set(NFSU2_FFMPEG_DIR "" CACHE PATH "FFmpeg (vp6 decoder) install prefix")
+if(NFSU2_FFMPEG_DIR)
+    if(NOT EXISTS "${NFSU2_FFMPEG_DIR}/lib/libavcodec.a")
+        message(FATAL_ERROR "no libavcodec.a in ${NFSU2_FFMPEG_DIR}/lib (tools/build_ffmpeg_vp6.sh)")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE src/movie_vp6.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_VP6=1)
+    # BEFORE: the Switch portlibs include dir has devkitPro's (GPL) FFmpeg headers.
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE "${NFSU2_FFMPEG_DIR}/include")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "${NFSU2_FFMPEG_DIR}/lib/libavcodec.a" "${NFSU2_FFMPEG_DIR}/lib/libavutil.a")
+endif()
+
+if(NFSU2_VULKAN)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_VULKAN=1)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -84,12 +111,24 @@ if(NINTENDO_SWITCH)
     set(NFSU2_SWITCH_APP_NAME "NFS Underground 2 (Xbox recomp)" CACHE STRING
         "Title shown in the homebrew menu")
     set(NFSU2_SWITCH_AUTHOR "nfsu2-xbox" CACHE STRING "Author shown in the homebrew menu")
-    set(NFSU2_SWITCH_VERSION "0.1.0" CACHE STRING "Version shown in the homebrew menu")
+    set(NFSU2_SWITCH_VERSION "0.3" CACHE STRING "Version shown in the homebrew menu")
     set(NFSU2_SWITCH_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg" CACHE FILEPATH
         "256x256 JPEG icon (libnx default when empty)")
 
-    # switch-sdl2's GL path is EGL on switch-mesa.
-    target_link_libraries(${PROJECT_NAME} PRIVATE EGL glapi drm_nouveau nx m)
+    if(NFSU2_VULKAN)
+        # No GL: SDL is only the audio output; NVK comes with nv2a_vk.
+        target_link_libraries(${PROJECT_NAME} PRIVATE nx m)
+    else()
+        # switch-sdl2's GL path is EGL on switch-mesa.
+        target_link_libraries(${PROJECT_NAME} PRIVATE EGL glapi drm_nouveau nx m)
+    endif()
+    # SDL's audio thread gets a real-time priority and audren gaps are
+    # counted (switch_nx.c, "SDL's audio thread").
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "LINKER:--wrap=SDL_SYS_SetThreadPriority"
+        "LINKER:--wrap=audrvVoiceAddWaveBuf")
+    set_property(SOURCE src/switch_nx.c APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
     # switch_nx.c's loading screen asks EGL for the on-screen size.
     target_include_directories(${PROJECT_NAME} PRIVATE "$ENV{DEVKITPRO}/portlibs/switch/include")
 

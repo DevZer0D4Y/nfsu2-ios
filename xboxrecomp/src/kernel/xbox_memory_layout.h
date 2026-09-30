@@ -187,6 +187,10 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* Give a block back; 0 if va is not one the arena handed out. */
+int xbox_ContiguousFree(uint32_t va);
+/* Size of the live block containing va, or 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t va);
 /* The physical range the contiguous arena has handed out (xbox_devbus.c). */
 void xbox_ContiguousSetPhysicalRange(uint32_t lo, uint32_t hi);
 int  xbox_ContiguousIsPhysical(uint32_t phys);

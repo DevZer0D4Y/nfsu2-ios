@@ -28,7 +28,8 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 - Clean up every Linux test run. `pkill -x nfsu2_recomp` does NOT match (the
   process renames itself), and `timeout`/`xvfb-run` leave orphans that keep
   burning CPU; kill by PID:
-  `ps -eo pid,args | awk '$2 ~ /nfsu2_recomp$/ || $2 ~ /^Xvfb$/ {print $1}' | xargs -r kill`
+  `ps -eo pid,args | awk '$2 ~ /nfsu2_recomp$/ || $2 ~ /^Xvfb$/ {print $1}' | xargs -r kill -9`
+  (it ignores SIGTERM; `rtk ps` output hides it -- use `rtk proxy ps`)
 
 ## Layout and builds
 
@@ -37,7 +38,7 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 | `/root/nfsu2x/` (WSL) | `game/` extracted disc, `gen/` lifted C, `build-pr128/` Linux, `build-switch/` Switch, `dis.py ADDR [+N]`, `snap.sh SECS ENV=..` (gdb stacks, `BIN=`), `run_eden.sh SECS` |
 | `xboxrecomp/` | vendored toolkit = xboxrecomp main + PR #128 + all port changes (copied from the `/root/nfsu2x/xboxrecomp-pr128` worktree; keep the two in sync) |
 | `src/main.c` | boot; defaults RECOMP_VBLANK=1, RECOMP_AC97_READY=plain, RECOMP_USB=1, RECOMP_PB_EXEC=1; APU at 0xFE800000 via `xbox_MmioRegister`; Switch runs the game on a 16 MB pthread |
-| `src/recomp_manual.c` | memmove ×2 (0x2A7EE0, 0x2A9450), AC97 reset 0x33518D, DSP ack wrapper 0x32EB65, D3D fence wrapper 0x2E8F20 |
+| `src/recomp_manual.c` | memmove ×2 (0x2A7EE0, 0x2A9450), AC97 reset 0x33518D, DSP ack wrapper 0x32EB65, D3D fence wrapper 0x2E8F20, VP6 movie frames 0x2618F0 (-> src/movie_vp6.c, FFmpeg) |
 | `src/switch_nx.c` | log, `nfsu2x_env.txt`, exception handler, t= stamps |
 
 - Regenerate C: `tools/regen.sh` (`LIFT_ONLY=1` after manual-override edits;
@@ -159,6 +160,12 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   profile at a crash had the main thread 48% in GIL waits, the EA mixer 50%
   on those locks. Fix: `mcpx_apu_lock_guest` counts waiters and the frame
   thread hands the lock over after every frame (apu_core.c / apu_state.h).
+  That handover then made the APU wait for the caller to be scheduled: race
+  profile 71.6% of the APU thread in that wait, APU 1124-1480 frames/s ->
+  audio stutter. voice_lock now sets its bits atomically, without d->lock
+  (the handover remains only for apu_mixer_play).
+- prof.bin sample times are 16 bits of 10 ms and wrap every 655 s;
+  prof_report.py unwraps them (--time on long runs was empty before).
 - **Files:** no `open()` on directories (`XBOX_DIR_FD` sentinel); FAT can't
   hold sparse files (partition images created empty, size reported).
 - **Save load/create froze the whole console** (log stops right after
@@ -189,13 +196,109 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (`xbox_nx_pad_rumble`: left = low band 160 Hz, right = high band 320 Hz,
   handheld + player 1), SDL rumble on Linux. Only changes are sent.
   `RECOMP_RUMBLE=0` off, `RECOMP_RUMBLE_TRACE=1` logs each change.
-- **Render scale:** `RECOMP_GL_SCALE=1|2|4` (nv2a_gl.c) stores every
-  surface at that multiple (`GlSurf.pw/ph`; `w/h` stay the title's pixels
+- **Render scale:** `RECOMP_GL_SCALE=<k>` (0.5..4, fractions like 1.5 ok;
+  nv2a_gl.c and nv2a_vk.c) stores every surface at that multiple, rounded
+  (`GlSurf/VkSurf.pw/ph`; `w/h` stay the title's pixels
   for shaders, clips and lookups); viewport, clear scissor, read-backs,
   `RECOMP_GL_DUMP` and the present blit use the stored size. Capped per
-  surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE.
+  surface by GL_MAX_TEXTURE/RENDERBUFFER_SIZE (Vulkan: maxImageDimension2D/
+  maxFramebuffer*).
+- **Switch wording** (src/text_patch.c): the English string table (chunk
+  0x39000 in ZZDATA2/5: {0x10, count, table, pool}, {hash, offset} sorted by
+  hash, packed pool) is rewritten as NtReadFile delivers it
+  (`xbox_file_read_hook`): START -> +, replay "Black" -> R, Xbox Live /
+  hard disk / Dashboard / Gamertag / Thumbstick -> neutral names. The pool
+  is rebuilt and must not grow. On by default on Switch, `NFSU2_SWITCH_TEXT`
+  =0/1. Button icons ($JOY_EVENT_...$ tokens) are textures, not covered.
+- **Second pad / split screen:** ohci.c now carries two USB pads on HC0
+  (root ports 1 and 2), routed by the ED's function address; pad 2 is
+  plugged/unplugged as host pad 1 (Switch No2, SDL's second pad) comes and
+  goes, after pad 1 is addressed. Switch: player 1 = handheld + No1, player 2
+  = No2; `RECOMP_NX_JOYCON=single` = one sideways Joy-Con per player
+  (`RECOMP_NX_JOYCON_ROTATE=0` if the stick comes out turned twice).
+  `RECOMP_USB_PADS=1` = one pad; `RECOMP_USB_PORT2` moves pad 2.
+  `RECOMP_PAD2_SCRIPT` scripts pad 2 (and keeps it plugged); log `PADn: step`.
+  NFSU2: Main Menu -> right -> "2 Player Split-Screen"; at car select the
+  players are whoever presses **Start** first ("Player One/Two Press START",
+  A does not count). Linux 2026-09-30: split-screen race starts with both
+  HUDs, but the GL renderer draws the 3D world black in split screen (open).
+  Menu dumps run ~60 frames/s: RECOMP_GL_DUMP=<p>,61 is about one a second.
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
+
+## Vulkan build (nfsu2x-vulkan.nro, started 2026-09-29)
+
+- Renderer `xboxrecomp/src/nv2a_vk/nv2a_vk.c` (CMake `NFSU2_VULKAN=ON` ->
+  `XBOXRECOMP_VULKAN`, replaces nv2a_gl): Vulkan 1.3, dynamic rendering,
+  push descriptors, dynamic vertex input, everything but blend/colour mask/
+  depth format/topology class as dynamic state; all images in GENERAL,
+  barriers between passes; 2 frames in flight with a 48 MB host ring each.
+  Shaders are gl_vsh.c/gl_psh.c with `nv2a_shader_vk = 1` (std140 blocks at
+  bindings 0/1, samplers 2..5, Vulkan 0..1 clip z), compiled by glslang on a
+  4 MB-stack thread. No threaded submission or loading screen yet.
+- Switch: `VULKAN=1 XBOXRECOMP_DIR=/root/nfsu2x/xboxrecomp-pr128 JOBS=6 bash
+  switch/build.sh` (build dir /root/nfsu2x/build-switch-vk). Links
+  mesa-switch's static NVK from `/root/nfsu2x/mesa-sdk/usr/local` (commit
+  1a8c1a66d6f + StevensND/nfsmw-nx `mesa/mesa-switch-nfsmw.patch`, built in
+  /root/nfsu2x/ref/mesa-switch: `. /root/nfsu2x/mesa-extra/env.sh; ninja -C
+  builddir-switch src/nouveau/vulkan/libvulkan.a; meson install -C
+  builddir-switch --destdir /root/nfsu2x/mesa-sdk` -- the cross/native files
+  and rustc/bindgen wrappers are in /root/nfsu2x/mesa-extra) and glslang
+  15.4 built for the Switch in /root/nfsu2x/glslang-switch. switch-sdl2's
+  EGL/glapi/drm_nouveau are filtered out of SDL2::SDL2 (a second Mesa);
+  SDL's unused EGL calls are stubbed (switch_egl_stubs.c), libelf too.
+- Linux: `-DNFSU2_VULKAN=ON` build in /root/nfsu2x/build-vk-linux; headless on
+  lavapipe: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+  RECOMP_VK_HEADLESS=1` (+ `RECOMP_VK_VALIDATION=1`), frames via
+  RECOMP_GL_DUMP. Quick Race renders like GL there.
+- /root/nfsu2x/vktest/ (vktest.nro): minimal NVK clear-screen check.
+- Caches (like GL's progcache.bin): progcache.bin records are shared with
+  GL; vkspirv.bin (glslang output by GLSL hash), vkpipes.bin (pipeline
+  variants), vkpipecache.bin (VkPipelineCache, saved at most every 20 s when
+  pipelines were added). All built at boot; RECOMP_PROG_CACHE=0 disables.
+- Audio still behind in races after the voice_lock change (console
+  2026-09-29: APU 1304-1467 frames/s, frame thread 81% in a cond wait, only
+  ~14% working). `[perf] APU pacing:` (switch_nx.c, apu_core.c throttle
+  counters) shows waits asked vs slept, clock restarts and lost ms.
+  Cause found (2026-09-30 log: 0 clock restarts, ~1950 blocks/10 s = 1560
+  frames/s of clock, but only ~1250-1300 real frames): while the front end
+  was TRAPPED/HALTED the loop ran silent monitor frames and advanced the
+  clock -- ~17% silence in races. Now time stops while trapped (xemu does
+  the same) and throttle() catches up; the pacing line counts traps.
+- **FPS drop on traffic collisions, part 2** (2026-09-30, Vulkan, APU fixed):
+  crash frames ~100 ms vs ~45. Main thread per frame: game code ~59 ms vs
+  20 (the crash physics chain sub_001F1260 > sub_001C1510 > sub_001B4CD0 >
+  sub_001BAA90 > sub_001BAB00/001B2FF0/001B6700: 2% -> 15-19% inclusive,
+  self time spread thin, no single hot leaf) and GIL wait ~32 ms vs 7; the
+  EA mixer 37% blocked on the dispatch lock (KfRaiseIrql, GIL released) --
+  someone at DISPATCH holds both, probably DirectSound's trap ISR/DPC (382
+  traps/10 s). `RECOMP_NX_PROFILE=2` samples threads over 2% to catch it.
+  NFSU2_SIM_STEPS=3 A/B: no difference (worst 102 vs 98 ms) -- not the cap.
+  Profile with RECOMP_NX_PROFILE=2: kernel_timer_thread ~40% waiting for the
+  GIL inside DirectSound's DPC (sub_0032BFF0/0032C012: KfRaise/LowerIrql
+  around every voice-list update), holding the dispatch lock meanwhile (the
+  mixer's 37%). Two bugs: (1) every IRQL call was a GIL handover; (2)
+  recomp_preempt read the *global* IRQL, which the timer thread raises
+  before queueing for the GIL, so the holder never yielded to the DPC.
+  Fixed: IRQL ordinals 103/129/130/160/161 keep the GIL (irql_transition
+  try-locks the dispatch lock, suspends the GIL only if contended);
+  per-thread `xbox_thread_holds_dispatch()` for pre-emption; a GIL waiter at
+  DISPATCH sets g_gil_contended at once.
+- nfsmw-nx is GPLv3: take ideas, not files.
+- **Vulkan render bugs (2026-09-30):** (1) front face was swapped: NV2A
+  winding is on-screen, top-first rows = Vulkan's framebuffer, so CW -> CW
+  (only nv2a_gl swaps, its window y is flipped). Every culled draw lost its
+  front faces: headlight glass / grille in the main menu, walls, objects.
+  (2) the VK prelude clamped clip z to [0, |w|], so vertices behind the eye
+  (w < 0) got z = 0 instead of ~w and skewed depth across the eye plane;
+  now clamped only when w > 0. Found on lavapipe by reading one pixel back
+  after every draw (GL vs VK, same frame) -- an ad-hoc probe, not in tree.
+- **Eden cannot run NVK** (2026-09-29): instance, device, swapchain (only
+  IMMEDIATE; FIFO creation hangs) and command recording work, but no GPU
+  submission ever completes -- vktest's first fence times out (also with
+  NVK_SWITCH_MAPPED_COMPLETION=false) and present then blocks. The game
+  stops at its first flip. Test the Vulkan build on hardware.
+  `RECOMP_VK_TRACE=<n>` + `NFSU2_LOG_SYNC=1` log each renderer step.
 
 ## Audio (host output)
 
@@ -206,6 +309,40 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   `RECOMP_AUDIO_BLOCKS` queue depth (default 8, Switch 12), `RECOMP_AUDIO_VOLUME`
   0..100. Capture on Linux: `SDL_AUDIODRIVER=disk SDL_DISKAUDIOFILE=out.raw`
   (48 kHz s16 stereo, real-time paced); `dummy` for tests without sound.
+- **Console audio crackle/hiss (2026-09-30, fix awaiting hardware test):**
+  switch-sdl2 plays through audren with two 1024-sample wave buffers; its
+  audio thread asks for TIME_CRITICAL, which SDL's Switch port maps to 59
+  (time-sliced) -> late refills, audren plays gaps. Linker `--wrap`
+  (CMakeLists.txt, switch_nx.c) sets it to 0x2B (`RECOMP_NX_AUDIO_PRIO=0`
+  off) and counts gaps: `[perf] audio out: ... device gaps, worst ... ms
+  between buffers` (21.3 ms nominal).
+- **Still thin/tinny/hiss on the console after that (2026-09-30):** Linux
+  capture is clean (no gaps, music spectrum, peaks -10 dBFS). Menu/movie
+  audio = one S16 48 kHz stereo ring voice v0F4 (EA mixer's FL/FR, bins 0/1,
+  -6 dB; v0F5/F6 = C/LFE, rears; 6-ch interleave, 2400-sample ring, refilled
+  in 256-sample chunks 224-736 samples ahead of CBO). RECOMP_APU_TRACE
+  itself injects 5-zero runs at frame starts (~100/s) -- never judge audio
+  from a traced run. Diagnostics: `[perf] APU ring voices: N of M samples
+  stale` (VP read = one lap earlier -> mixer late; Linux ~0.3%, SCHED_RR
+  one-core sim 1.5-6%), `RECOMP_AUDIO_DUMP=<path>,<start s>,<secs>` (exact
+  PCM given to SDL). Opt-in `RECOMP_NX_GUEST_RT=1`: time-critical guest
+  thread (the mixer) at host 0x2D -- did not help in the RR sim (GIL is
+  FIFO). Awaiting a console log + dump.
+- **Music hiss, all platforms (fixed 2026-09-30):** the translator had no
+  `pushad`/`popad` (RECOMP_UNIMPL). EA's music resampler `sub_0027CCF0`
+  (32 kHz EA-XA -> 48 kHz, 32.32 fixed point with adc, linear interp) is
+  bracketed by them, so it returned its scratch registers to the mixer
+  (`sub_00279A82`, 512-sample blocks), which then lost the fractional
+  position every block: a 1/3-sample jump every 10.7 ms (hiss, worst on
+  bass) and music 0.18% slow. Now lifted (lifter.py; translator.py marks all
+  registers used; tools/recomp/test_pushad.py). Measured on Linux against
+  the disc track (ZZDATA8 stream 38, decoded with a vgmstream-style EA-XA R2
+  decoder): 0 jumps, 1 ms windows match at 49 dB. Only 9 gen files change
+  (recomp_0023/28/29/36/50/52/53/70/78). `RECOMP_APU_VOICE_DUMP=<voice hex>,
+  <path>,<start s>,<secs>` (apu_vp.c) dumps one voice before/after its
+  filter as float32 plus its registers once a second; v0F4 = menu music.
+  Still open: `cvtss2si` is lifted as a truncating cast (x86 rounds), 41
+  sites -- not this bug, but wrong.
 - APU IRQ 5 was raised on Windows only (`#if _WIN32` in apu_core.c) -> no
   DirectSound voice ever started elsewhere.
 - NFSU2 mixes in software (EA engine, thread `sub_00274CA0`) into three 50 ms
@@ -253,7 +390,21 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   XGSCNT went to garbage (`APU 0 frames/s`). Now `qemu_qpc_scale()`. Results
   that depend on audio pacing from a long-running console/WSL before this
   fix are suspect.
-- Movie decoding runs on the game thread: MMX IDCT `sub_0026EB34`, MC
+- **Movies are VP6, decoded by FFmpeg** (2026-09-30, idea from nfsmw-nx
+  docs/audio-and-video.md): EA `MVhd` streams inside ZZDATA0-2.BIN (not the
+  B3/*.xmv files), 640x480 ~30 fps, `MV0K`/`MV0F` chunks. The player
+  (sub_0025F909) passes each chunk payload to `sub_002618F0(dec, data,
+  size, w, h)` = On2's VP6 decoder; overridden in recomp_manual.c to decode
+  with FFmpeg into `[dec+0x244]` and swap it with `[dec+0x254]` (the output
+  sub_0026144D reports). Planes are bottom-up, Y stride +0x1B8 / UV +0x1BC,
+  offsets +0x21C/+0x220/+0x224, 48/24-pixel border (left unfilled).
+  `NFSU2_NATIVE_VP6=0` lifted decoder, `=2` both + compare (Linux: 2100
+  frames bit-exact). FFmpeg is a minimal **LGPL** build, vp6 decoder only
+  (`tools/build_ffmpeg_vp6.sh switch|linux` -> /root/nfsu2x/ffmpeg-vp6-*;
+  CMake `-DNFSU2_FFMPEG_DIR`, switch/build.sh `FFMPEG_DIR`). devkitPro's
+  switch-ffmpeg is `--enable-gpl` -- don't link it. Log: `[movie] VP6: n
+  frames, x ms average`. Linux x86 (plain C): ~1 ms/frame.
+- (Before the FFmpeg decoder) movie decoding ran on the game thread: MMX IDCT `sub_0026EB34`, MC
   `sub_0025ECB4`, `sub_0026FBB1` (Linux perf of the movies). The translator
   keeps registers of MMX *leaf* functions in shadowing C locals
   (`_localize_leaf_registers`, `recomp_leaf_ld_*`/`st_*`; 21 functions,
@@ -262,6 +413,9 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
 - Switch log: floats printed from inside the log device's `%f` timestamp
   shared newlib's dtoa buffer, so every `[perf]` fps figure was a copy of its
   timestamp's digits. The timestamp is integer-formatted now.
+- `NFSU2_NO_LOG=1` (or `NFSU2_LOG=0`) in nfsu2x_env.txt: the log device
+  drops everything after the settings lines, no flusher/[perf], no
+  profiler, no xbox_kernel.log (`RECOMP_NO_LOG=1`, kernel_thunks.c).
 - Switch defaults: `RECOMP_QUIET=1` (kernel summaries, [READ], DMA_PUT, GPU
   stats each flushed stderr = an SD write); lifted code built `-O2`
   (`NFSU2_GEN_OPT`, others `-O1`); build with `JOBS=6` so -O2 fits in RAM.

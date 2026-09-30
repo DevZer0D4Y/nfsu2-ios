@@ -147,20 +147,29 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* One bit per voice, read atomically by the frame thread (is_voice_locked).
+ * Set without d->lock: DirectSound issues this for every voice it touches,
+ * and waiting for the frame thread's lock -- or making the frame thread
+ * wait for the caller to be scheduled (Horizon's 10 ms slices) -- cost the
+ * APU up to a quarter of real time in races (audio stutter). The signal
+ * only wakes an idle frame thread; a missed one is picked up at its next
+ * timed wait. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    mcpx_apu_lock_guest(d);
-
     uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
-
+#ifdef _MSC_VER
+    if (lock)
+        _InterlockedOr64((volatile long long *)&d->vp.voice_locked[v / 64], (long long)mask);
+    else
+        _InterlockedAnd64((volatile long long *)&d->vp.voice_locked[v / 64], (long long)~mask);
+#else
+    if (lock)
+        __atomic_fetch_or(&d->vp.voice_locked[v / 64], mask, __ATOMIC_SEQ_CST);
+    else
+        __atomic_fetch_and(&d->vp.voice_locked[v / 64], ~mask, __ATOMIC_SEQ_CST);
+#endif
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -740,6 +749,50 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * Sample fetching from voice buffers
  * ============================================================ */
 
+/* Stale ring reads. A title that mixes in software (NFSU2's EA mixer) keeps
+ * one looping voice as a ring and refills it a few ms ahead of the play
+ * cursor. When its thread runs late, the VP plays what the ring held one lap
+ * earlier -- 50 ms old sound spliced into the stream, heard as a thin,
+ * metallic, crackling edge. That shows as a sample identical to the one read
+ * at the same position a lap ago. Only voices whose data mostly changes
+ * between laps count: a looped static sample repeats by design. */
+#define RING_TRACK_MIN 1024                 /* shorter loops: static samples */
+#define RING_TRACK_MAX 8192
+static struct {
+    uint32_t *lap;
+    uint32_t  same, changed;
+} s_ring[MCPX_HW_MAX_VOICES];
+
+static void ring_note(uint32_t v, uint32_t pos, uint32_t raw)
+{
+    if (!raw || pos >= RING_TRACK_MAX)
+        return;
+    if (!s_ring[v].lap) {
+        s_ring[v].lap = (uint32_t *)calloc(RING_TRACK_MAX, sizeof(uint32_t));
+        if (!s_ring[v].lap)
+            return;
+    }
+    if (s_ring[v].lap[pos] == raw) s_ring[v].same++;
+    else                           s_ring[v].changed++;
+    s_ring[v].lap[pos] = raw;
+}
+
+/* Stale samples vs all samples read from ring voices since the last call. */
+void mcpx_apu_ring_stats(uint32_t *stale, uint32_t *total)
+{
+    uint32_t st = 0, tot = 0;
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        uint32_t same = s_ring[v].same, changed = s_ring[v].changed;
+        if (changed > same) {
+            st += same;
+            tot += same + changed;
+        }
+        s_ring[v].same = s_ring[v].changed = 0;   /* ponytail: racy, counters only */
+    }
+    *stale = st;
+    *total = tot;
+}
+
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
@@ -889,8 +942,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                     linear_addr);
             }
 
+            uint32_t raw = 0;
             for (unsigned int channel = 0; channel < channels; channel++) {
-                uint32_t ival;
+                uint32_t ival = 0;
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
@@ -915,7 +969,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 }
                 samples[sample_count][channel] = fval;
                 addr += container_size;
+                raw = raw * 0x9E3779B1u + ival;
             }
+            if (loop && !stream && ebo + 1 >= RING_TRACK_MIN)
+                ring_note(v, cbo, raw);
         }
 
         if (!stereo) {
@@ -1017,6 +1074,79 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
 /* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
+
+/* RECOMP_APU_VOICE_DUMP=<voice hex>,<path>,<start s>,<secs>: one voice's
+ * samples as the VP produced them (after pitch/resample) and after its
+ * low-pass filter, float32 L R Lf Rf per sample, kept in RAM and written
+ * once full; plus its filter/volume registers once a second. A debug aid
+ * for noise in the output: it tells the title's own samples from what the
+ * VP adds. Time counts this voice's frames (1500/s). */
+static struct {
+    int      on, voice, done;
+    char     path[256];
+    long     skip, left;              /* frames of 32 samples */
+    float   *buf;
+    size_t   n, cap;
+    float    pre[NUM_SAMPLES_PER_FRAME][2];
+} s_vdump = { -1 };
+
+static int vdump_want(uint16_t v)
+{
+    if (s_vdump.on < 0) {
+        const char *e = getenv("RECOMP_APU_VOICE_DUMP");
+        char tmp[300], *c1, *c2, *c3;
+        s_vdump.on = 0;
+        if (!e || !*e) return 0;
+        snprintf(tmp, sizeof tmp, "%s", e);
+        c1 = strchr(tmp, ','); c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        c3 = c2 ? strchr(c2 + 1, ',') : NULL;
+        if (!c3) return 0;
+        *c1 = *c2 = *c3 = 0;
+        s_vdump.voice = (int)strtol(tmp, NULL, 16);
+        snprintf(s_vdump.path, sizeof s_vdump.path, "%s", c1 + 1);
+        s_vdump.skip = atol(c2 + 1) * 1500L;
+        s_vdump.left = atol(c3 + 1) * 1500L;
+        s_vdump.cap = (size_t)s_vdump.left * NUM_SAMPLES_PER_FRAME * 4;
+        s_vdump.buf = (float *)malloc(s_vdump.cap * sizeof(float));
+        s_vdump.on = s_vdump.buf != NULL;
+        fprintf(stderr, "[APU] voice dump: v%03X to %s\n", s_vdump.voice, s_vdump.path);
+    }
+    return s_vdump.on && !s_vdump.done && v == s_vdump.voice;
+}
+
+static void vdump_frame(MCPXAPUState *d, uint16_t v, float post[][2], int fmode,
+                        float rate, float ea, const uint16_t *vol, const int *bin)
+{
+    static long frames;
+    if (!(++frames % 1500)) {
+        uint32_t fca = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_FCA, 0xFFFFFFFF);
+        uint32_t fcb = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_FCB, 0xFFFFFFFF);
+        fprintf(stderr, "[APU-VD] v%03X fmode %d fca %08X fcb %08X rate %.6f ea %.3f"
+                        " vol %03X %03X %03X %03X %03X %03X %03X %03X bins %d %d %d %d %d %d %d %d"
+                        " fmt %08X ba %08X ebo %X cbo %X phys %08X\n", v, fmode, fca, fcb, rate, ea,
+                vol[0], vol[1], vol[2], vol[3], vol[4], vol[5], vol[6], vol[7],
+                bin[0], bin[1], bin[2], bin[3], bin[4], bin[5], bin[6], bin[7],
+                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, 0xFFFFFFFF),
+                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, 0xFFFFFFFF)));
+    }
+    if (s_vdump.skip > 0) { s_vdump.skip--; return; }
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        s_vdump.buf[s_vdump.n++] = s_vdump.pre[i][0];
+        s_vdump.buf[s_vdump.n++] = s_vdump.pre[i][1];
+        s_vdump.buf[s_vdump.n++] = post[i][0];
+        s_vdump.buf[s_vdump.n++] = post[i][1];
+    }
+    if (--s_vdump.left <= 0) {
+        FILE *f = fopen(s_vdump.path, "wb");
+        if (f) { fwrite(s_vdump.buf, sizeof(float), s_vdump.n, f); fclose(f); }
+        fprintf(stderr, "[APU] voice dump written (%zu floats)\n", s_vdump.n);
+        s_vdump.done = 1;
+    }
+}
 
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
@@ -1150,6 +1280,10 @@ static void voice_process(MCPXAPUState *d,
 
     if (voice_should_mute(v)) return;
 
+    int vdump = vdump_want(v);
+    if (vdump)
+        memcpy(s_vdump.pre, samples, sizeof s_vdump.pre);
+
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
@@ -1177,6 +1311,9 @@ static void voice_process(MCPXAPUState *d,
             }
         }
     }
+
+    if (vdump)
+        vdump_frame(d, v, samples, fmode, rate, ea_value, vol, bin);
 
     /* HRTF processing for 3D voices */
     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
@@ -1322,6 +1459,21 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             if (a > g_vp_mix_peak) g_vp_mix_peak = a;
         }
     apu_vp_trace_second();
+    {   /* RECOMP_APU_RING_STATS=1: stale ring reads every 10 s (Linux; the
+         * Switch prints them in its [perf] report) */
+        static int on = -1;
+        static DWORD next;
+        if (on < 0) on = getenv("RECOMP_APU_RING_STATS") != NULL;
+        if (on && GetTickCount() >= next) {
+            uint32_t st, tot;
+            if (next) {
+                mcpx_apu_ring_stats(&st, &tot);
+                fprintf(stderr, "[APU] ring voices: %u of %u samples stale (%.2f%%)\n",
+                        st, tot, tot ? 100.0 * st / tot : 0.0);
+            }
+            next = GetTickCount() + 10000;
+        }
+    }
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

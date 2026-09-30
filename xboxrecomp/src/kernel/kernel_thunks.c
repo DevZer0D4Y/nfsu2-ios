@@ -402,12 +402,19 @@ void xbox_kernel_init(void)
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;
 
-    /* Try to open log file, fall back to stderr */
-    g_log_file = fopen("xbox_kernel.log", "w");
+    /* Try to open log file, fall back to stderr. RECOMP_NO_LOG=1: none at
+     * all (and nothing below errors is formatted). */
+    {
+        const char *nl = getenv("RECOMP_NO_LOG");
+        if (nl && *nl == '1')
+            g_log_level = -1;
+        else
+            g_log_file = fopen("xbox_kernel.log", "w");
+    }
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");
-    if (log_env) {
+    if (log_env && g_log_level >= 0) {
         g_log_level = atoi(log_env);
         if (g_log_level < XBOX_LOG_ERROR) g_log_level = XBOX_LOG_ERROR;
         if (g_log_level > XBOX_LOG_TRACE) g_log_level = XBOX_LOG_TRACE;

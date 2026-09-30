@@ -189,18 +189,46 @@ static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
+/* Whether this thread holds the dispatch lock. IRQL itself (g_current_irql)
+ * is one value for the one emulated CPU, so "is IRQL raised?" answers for
+ * whoever raised it last; decisions about *this* thread -- may it be
+ * pre-empted, is it a DPC waiting for the guest lock -- ask this instead. */
+#ifdef _MSC_VER
+static __declspec(thread) int t_dispatch_held;
+#else
+static _Thread_local int t_dispatch_held;
+#endif
+int xbox_thread_holds_dispatch(void) { return t_dispatch_held; }
+
+int  xbox_gil_suspend(void);
+void xbox_gil_resume(int depth);
+
 static void irql_transition(KIRQL from, KIRQL to)
 {
     InitOnceExecuteOnce(&g_dispatch_once, dispatch_lock_init, NULL, NULL);
     /* Raised also counts as busy for NtSuspendThread: suspension is an APC,
      * which the Xbox only delivers below DISPATCH, and a thread frozen here
      * would hold the dispatch lock (every ISR, DPC and raised section) with
-     * it. */
+     * it.
+     *
+     * The IRQL calls keep the guest lock (kernel_call_keeps_gil): DirectSound
+     * raises and lowers around every voice-list update, and handing the lock
+     * over at each one let the main thread in between a DPC's raises, with
+     * the DPC then waiting for it while holding the dispatch lock. Blocking
+     * here with the guest lock held could deadlock against a DPC that holds
+     * the dispatch lock and wants the guest lock, so a contended raise lets
+     * go of it first (a no-op when the caller does not hold it). */
     if (from < DISPATCH_LEVEL && to >= DISPATCH_LEVEL) {
-        EnterCriticalSection(&g_dispatch_lock);
+        if (!TryEnterCriticalSection(&g_dispatch_lock)) {
+            int gil = xbox_gil_suspend();
+            EnterCriticalSection(&g_dispatch_lock);
+            xbox_gil_resume(gil);
+        }
+        t_dispatch_held = 1;
         xbox_kernel_busy(1);
     } else if (from >= DISPATCH_LEVEL && to < DISPATCH_LEVEL) {
         xbox_kernel_busy(-1);
+        t_dispatch_held = 0;
         LeaveCriticalSection(&g_dispatch_lock);
     }
 }

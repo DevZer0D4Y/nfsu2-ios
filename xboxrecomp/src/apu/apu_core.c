@@ -384,6 +384,30 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/* Pacing statistics for the [perf] report (mcpx_apu_pacing_stats): timed
+ * waits, requested vs slept, the SDL low-queue path, clock restarts after
+ * EP_CATCHUP_US of lateness (time lost for good) and the worst lateness. */
+static volatile int64_t s_thr_waits, s_thr_req_us, s_thr_slept_us, s_thr_lowq,
+                        s_thr_resets, s_thr_lost_us, s_thr_late_max_us, s_thr_blocks,
+                        s_thr_traps, s_thr_trap_us;
+
+int mcpx_apu_pacing_stats(char *buf, int cap)
+{
+    int n = snprintf(buf, (size_t)cap,
+                     "%lld blocks, %lld waits (asked %lld ms, slept %lld ms), %lld low-queue,"
+                     " %lld clock restarts (%lld ms lost), worst lateness %lld ms,"
+                     " %lld front-end traps (%lld ms)",
+                     (long long)s_thr_blocks, (long long)s_thr_waits,
+                     (long long)(s_thr_req_us / 1000), (long long)(s_thr_slept_us / 1000),
+                     (long long)s_thr_lowq, (long long)s_thr_resets,
+                     (long long)(s_thr_lost_us / 1000), (long long)(s_thr_late_max_us / 1000),
+                     (long long)s_thr_traps, (long long)(s_thr_trap_us / 1000));
+    s_thr_blocks = s_thr_waits = s_thr_req_us = s_thr_slept_us = s_thr_lowq = 0;
+    s_thr_resets = s_thr_lost_us = s_thr_late_max_us = 0;
+    s_thr_traps = s_thr_trap_us = 0;
+    return n;
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
@@ -424,7 +448,11 @@ static void throttle(MCPXAPUState *d)
      * than ours) one block is rendered without waiting and without moving
      * the deadline, so the APU follows the device instead of underrunning;
      * a full queue drops blocks in the backend. */
+    s_thr_blocks++;
+    if (d->next_frame_time_us && now_us - d->next_frame_time_us > s_thr_late_max_us)
+        s_thr_late_max_us = now_us - d->next_frame_time_us;
     if (xa2_is_active() && xa2_queued() < xa2_queue_target() / 2) {
+        s_thr_lowq++;
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
@@ -444,6 +472,10 @@ static void throttle(MCPXAPUState *d)
      * suspended applet) restarts the clock. */
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_CATCHUP_US) {
+        if (d->next_frame_time_us) {
+            s_thr_resets++;
+            s_thr_lost_us += now_us - d->next_frame_time_us;
+        }
         d->next_frame_time_us = now_us;
     }
 
@@ -451,7 +483,11 @@ static void throttle(MCPXAPUState *d)
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
         if (remaining_ms > 0) {
+            int64_t w0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
+            s_thr_waits++;
+            s_thr_req_us += remaining_ms * 1000;
+            s_thr_slept_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - w0;
         } else {
             break;
         }
@@ -528,14 +564,36 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
+        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                NV_PAPU_SECTL_XCNTMODE);
+        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+
+        /* Front end trapped (an idle voice the driver asked to hear about)
+         * or halted: the pipeline stops until the driver's interrupt handler
+         * clears it, and so does time, as in xemu. This used to run silent
+         * monitor frames and let the clock run on: in races the handler is
+         * late (the guest is busy), ~17% of frames went out as silence --
+         * the audio stutter -- and the APU fell to 1250-1300 frames/s. Now
+         * no frame is lost: throttle() catches up afterwards (up to
+         * EP_CATCHUP_US). */
+        if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF && !g_test_tone.active &&
+            (fectl & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED))) {
+            int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (!d->in_trap) {
+                d->in_trap = true;
+                s_thr_traps++;
+            }
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            s_thr_trap_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
+            continue;
+        }
+        d->in_trap = false;
+
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
-        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                                NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);

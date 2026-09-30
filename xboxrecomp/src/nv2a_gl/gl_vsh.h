@@ -10,6 +10,9 @@
 int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
                         uint32_t start, char *buf, size_t cap);
 
+/* Nonzero: emit Vulkan GLSL (nv2a_vk). Set once, before the first shader. */
+extern int nv2a_shader_vk;
+
 /* Declarations and helpers every vertex shader starts with. */
 const char *nv2a_gl_vsh_prelude(void);
 /* main() for a vertex-program shader (follows the program body). */

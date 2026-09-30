@@ -932,6 +932,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
+
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -947,8 +949,13 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
+    int64_t pos = -1;
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+        pos = ByteOffset->QuadPart;
+    } else if (xbox_file_read_hook) {
+        pos = (int64_t)lseek(fd, 0, SEEK_CUR);
+    }
 
     ssize_t n = host_read(fd, Buffer, Length);
     if (n < 0) {
@@ -963,6 +970,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
         IoStatusBlock->Status = STATUS_END_OF_FILE;
         return STATUS_END_OF_FILE;
     }
+    if (xbox_file_read_hook && n > 0)
+        xbox_file_read_hook(Buffer, (size_t)n, pos);
     IoStatusBlock->Status = STATUS_SUCCESS;
     if (Event) SetEvent(Event);
     return STATUS_SUCCESS;

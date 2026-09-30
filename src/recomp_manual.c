@@ -454,6 +454,114 @@ void sub_00072F90(void)
     sub_00072F90_gen();
 }
 
+/* ── VP6 movie frames, sub_002618F0 ──────────────────────────
+ *
+ * cdecl (decoder, data, size, width, height): decodes one VP6 frame (the
+ * payload of an EA MV0K/MV0F chunk) with On2's decoder. The decoder block:
+ *   +0x1B0/+0x1B4  picture width/height    +0x1B8/+0x1BC  Y/UV stride
+ *   +0x21C/+0x220/+0x224  Y/U/V offsets in a frame buffer
+ *   +0x244  buffer being decoded   +0x254  last decoded (sub_0026144D's
+ *           output, and the reference) -- swapped after every frame
+ * Planes are bottom-up with a 48 (Y) / 24 (UV) pixel border for motion
+ * vectors past the edge. The movie player (sub_0025F909) then passes +0x254
+ * on to be drawn.
+ *
+ * Lifted, this is most of the CPU time of a movie on the Switch, so by
+ * default FFmpeg decodes the frame (src/movie_vp6.c) into +0x244 and the
+ * buffers are swapped as the original does. The border is not filled in:
+ * only On2's own motion compensation read it. NFSU2_NATIVE_VP6=0 runs the
+ * lifted decoder, =2 runs both and compares the pictures. */
+#ifdef NFSU2_NATIVE_VP6
+#include "movie_vp6.h"
+
+extern void sub_002618F0_gen(void);
+
+typedef struct {
+    uint32_t y, u, v, y_stride, uv_stride, w, h;
+} Vp6Planes;
+
+static Vp6Planes vp6_planes(uint32_t dec, uint32_t buf)
+{
+    Vp6Planes p;
+    p.y_stride = MEM32(dec + 0x1B8);
+    p.uv_stride = MEM32(dec + 0x1BC);
+    p.y = buf + MEM32(dec + 0x21C) + (p.y_stride + 1u) * 48u;
+    p.u = buf + MEM32(dec + 0x220) + (p.uv_stride + 1u) * 24u;
+    p.v = buf + MEM32(dec + 0x224) + (p.uv_stride + 1u) * 24u;
+    p.w = MEM32(dec + 0x1B0);
+    p.h = MEM32(dec + 0x1B4);
+    return p;
+}
+
+/* NFSU2_NATIVE_VP6=2: FFmpeg into a scratch picture, compared with what the
+ * lifted decoder left at +0x254. */
+static void vp6_check(uint32_t dec, uint32_t data, uint32_t size)
+{
+    static unsigned long frames, bad;
+    static uint8_t *pic;
+    Vp6Planes p = vp6_planes(dec, MEM32(dec + 0x254));
+    uint32_t cw = p.w / 2, row, diff = 0;
+
+    if (p.w > 4096 || p.h > 4096)
+        return;
+    if (!pic && !(pic = malloc(4096u * 4096u * 3u / 2u)))
+        return;
+    if (nfsu2_vp6_decode(dec, (const uint8_t *)XBOX_PTR(data), (int)size,
+                         pic, pic + p.w * p.h, pic + p.w * p.h + cw * (p.h / 2),
+                         (int)p.w, (int)cw, (int)p.w, (int)p.h) == 0) {
+        for (row = 0; row < p.h; row++)
+            diff += memcmp(pic + row * p.w, (const void *)XBOX_PTR(p.y + row * p.y_stride), p.w) != 0;
+        for (row = 0; row < p.h / 2; row++) {
+            diff += memcmp(pic + p.w * p.h + row * cw,
+                           (const void *)XBOX_PTR(p.u + row * p.uv_stride), cw) != 0;
+            diff += memcmp(pic + p.w * p.h + cw * (p.h / 2) + row * cw,
+                           (const void *)XBOX_PTR(p.v + row * p.uv_stride), cw) != 0;
+        }
+    } else {
+        diff = 1;
+    }
+    frames++;
+    if (diff && bad++ < 20)
+        fprintf(stderr, "[movie] VP6 check: frame %lu (%u bytes) differs in %u rows\n",
+                frames, size, diff);
+    if (frames % 300 == 0)
+        fprintf(stderr, "[movie] VP6 check: %lu frames, %lu differ\n", frames, bad);
+}
+
+void sub_002618F0(void)
+{
+    int mode = nfsu2_vp6_mode();
+    uint32_t dec = MEM32(esp + 4), data = MEM32(esp + 8), size = MEM32(esp + 12);
+    uint32_t cur;
+    Vp6Planes p;
+
+    if (mode != 1) {
+        sub_002618F0_gen();
+        if (mode == 2 && eax == 0)
+            vp6_check(dec, data, size);
+        return;
+    }
+    cur = MEM32(dec + 0x244);
+    p = vp6_planes(dec, cur);
+    if (nfsu2_vp6_decode(dec, (const uint8_t *)XBOX_PTR(data), (int)size,
+                         (uint8_t *)XBOX_PTR(p.y), (uint8_t *)XBOX_PTR(p.u),
+                         (uint8_t *)XBOX_PTR(p.v), (int)p.y_stride, (int)p.uv_stride,
+                         (int)p.w, (int)p.h) == 0) {
+        MEM32(dec + 0x244) = MEM32(dec + 0x254);
+        MEM32(dec + 0x254) = cur;
+    }
+    /* A frame FFmpeg rejects leaves the last picture up. */
+    MEM32(dec + 0x1E8) = size;
+    MEM32(0x00469D04u) += 1;            /* the decoder's frame counter */
+    eax = 0;
+    esp += 4;                           /* cdecl: the caller pops the arguments */
+}
+#else
+/* Built without FFmpeg (NFSU2_FFMPEG_DIR): the lifted decoder. */
+extern void sub_002618F0_gen(void);
+void sub_002618F0(void) { sub_002618F0_gen(); }
+#endif
+
 /* ── DirectSound DSP command post (0x0032EB65) ───────────────
  *
  * thiscall, ecx = the DSP-side object. Copies a command block into the GP

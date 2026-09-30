@@ -283,6 +283,29 @@ int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
 
     if (count > 8)
         count = 8;
+    if (nv2a_shader_vk)
+        /* Vulkan (nv2a_vk): std140 block at binding 1 -- vec2 array
+         * elements take 16 bytes -- and samplers at bindings 2..5. */
+        emit(&o,
+            "#version 450\n"
+            "layout(location = 0) in vec4 vD0; layout(location = 1) in vec4 vD1;\n"
+            "layout(location = 2) in vec4 vT0; layout(location = 3) in vec4 vT1;\n"
+            "layout(location = 4) in vec4 vT2; layout(location = 5) in vec4 vT3;\n"
+            "layout(location = 6) in float vFog;\n"
+            "layout(set = 0, binding = 2) uniform sampler2D t0;\n"
+            "layout(set = 0, binding = 3) uniform sampler2D t1;\n"
+            "layout(set = 0, binding = 4) uniform sampler2D t2;\n"
+            "layout(set = 0, binding = 5) uniform sampler2D t3;\n"
+            "layout(std140, set = 0, binding = 1) uniform FsU {\n"
+            "    vec2 u_tscale[4];\n"
+            "    vec4 u_c0[8]; vec4 u_c1[8];\n"
+            "    vec4 u_fc0; vec4 u_fc1;\n"
+            "    vec4 u_fogcolor;\n"
+            "    int u_alpha_func; float u_alpha_ref;\n"
+            "};\n"
+            "layout(location = 0) out vec4 fragColor;\n"
+            "void main() {\n");
+    else
     emit(&o,
         "#version 330 core\n"
         "in vec4 vD0; in vec4 vD1; in vec4 vT0; in vec4 vT1;\n"

@@ -21,9 +21,23 @@
  *   sticks, clicks, D-pad as they are
  *
  * Handheld mode and the first player's controller (Joy-Con pair or Pro
- * Controller) both drive port 0, and both get the title's rumble
+ * Controller) both drive port 0; player 2's controller drives port 1 (the
+ * second USB pad, for split screen). Each gets its own port's rumble
  * (xbox_nx_pad_rumble): the Xbox's left, heavy motor as the low band, its
  * right, light motor as the high band, on both sides of the pad.
+ *
+ * RECOMP_NX_JOYCON=single puts players 1 and 2 in single Joy-Con mode, so
+ * the two detached Joy-Cons are one player each, held sideways:
+ *
+ *   Xbox            sideways Joy-Con (either side)
+ *   A / B / X / Y   right / bottom / top / left face button (Nintendo's
+ *                   A B X Y positions, so the labels still match)
+ *   LT / RT         SL / SR
+ *   Start           - (left Joy-Con) or + (right)
+ *   left stick      the stick, turned with the Joy-Con
+ *
+ * RECOMP_NX_JOYCON_ROTATE=0 leaves the stick unturned, in case the system
+ * already turns it.
  */
 #ifdef __SWITCH__
 #include <switch.h>
@@ -34,37 +48,105 @@
 
 #include "xinput_nx.h"
 
-static PadState s_pad;
+#define NX_PADS 2
+
+static PadState s_pad[NX_PADS];     /* player 1 (handheld + No1), player 2 */
 static int      s_ready;
 static Mutex    s_lock;
 static int      s_positional;
+static int      s_rotate = 1;
+
+static void nx_pad_init(void)
+{
+    const char *layout = getenv("RECOMP_PAD_LAYOUT");
+    const char *joycon = getenv("RECOMP_NX_JOYCON");
+    const char *rotate = getenv("RECOMP_NX_JOYCON_ROTATE");
+
+    s_positional = layout && strcmp(layout, "position") == 0;
+    s_rotate = !(rotate && strcmp(rotate, "0") == 0);
+    padConfigureInput(NX_PADS, HidNpadStyleSet_NpadStandard);
+    if (joycon && strcmp(joycon, "single") == 0) {
+        hidSetNpadJoyHoldType(HidNpadJoyHoldType_Horizontal);
+        hidSetNpadJoyAssignmentModeSingleByDefault(HidNpadIdType_No1);
+        hidSetNpadJoyAssignmentModeSingleByDefault(HidNpadIdType_No2);
+    }
+    padInitializeDefault(&s_pad[0]);
+    padInitialize(&s_pad[1], HidNpadIdType_No2);
+    s_ready = 1;
+}
+
+/* One Joy-Con held sideways, rail up: the face buttons as Nintendo places
+ * them (right = A, bottom = B, top = X, left = Y) and the stick turned a
+ * quarter with the controller. */
+static void nx_sideways(u32 style, u64 *b, HidAnalogStickState *stick,
+                        HidAnalogStickState l, HidAnalogStickState r)
+{
+    u64 in = *b, out = 0;
+    s32 x, y;
+
+    if (style & HidNpadStyleTag_NpadJoyLeft) {
+        /* turned anticlockwise: Down is on the right, Left at the bottom */
+        if (in & HidNpadButton_Down)   out |= HidNpadButton_A;
+        if (in & HidNpadButton_Left)   out |= HidNpadButton_B;
+        if (in & HidNpadButton_Right)  out |= HidNpadButton_X;
+        if (in & HidNpadButton_Up)     out |= HidNpadButton_Y;
+        if (in & HidNpadButton_LeftSL) out |= HidNpadButton_ZL;
+        if (in & HidNpadButton_LeftSR) out |= HidNpadButton_ZR;
+        if (in & HidNpadButton_Minus)  out |= HidNpadButton_Plus;
+        if (in & HidNpadButton_StickL) out |= HidNpadButton_StickL;
+        x = s_rotate ? -l.y : l.x;
+        y = s_rotate ?  l.x : l.y;
+    } else {
+        /* turned clockwise: X is on the right, A at the bottom */
+        if (in & HidNpadButton_X)       out |= HidNpadButton_A;
+        if (in & HidNpadButton_A)       out |= HidNpadButton_B;
+        if (in & HidNpadButton_Y)       out |= HidNpadButton_X;
+        if (in & HidNpadButton_B)       out |= HidNpadButton_Y;
+        if (in & HidNpadButton_RightSL) out |= HidNpadButton_ZL;
+        if (in & HidNpadButton_RightSR) out |= HidNpadButton_ZR;
+        if (in & HidNpadButton_Plus)    out |= HidNpadButton_Plus;
+        if (in & HidNpadButton_StickR)  out |= HidNpadButton_StickL;
+        x = s_rotate ?  r.y : r.x;
+        y = s_rotate ? -r.x : r.y;
+    }
+    if (x < -32767) x = -32767;
+    if (y < -32767) y = -32767;
+    stick->x = x;
+    stick->y = y;
+    *b = out;
+}
 
 int xbox_nx_pad_read(unsigned port, uint16_t *digital, uint8_t analog[8],
                      int16_t thumbs[4])
 {
     u64 b;
+    u32 style;
     HidAnalogStickState l, r;
+    PadState *pad;
 
-    if (port != 0)
+    if (port >= NX_PADS)
         return 0;
+    pad = &s_pad[port];
     mutexLock(&s_lock);
-    if (!s_ready) {
-        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-        padInitializeDefault(&s_pad);
-        {
-            const char *layout = getenv("RECOMP_PAD_LAYOUT");
-            s_positional = layout && strcmp(layout, "position") == 0;
-        }
-        s_ready = 1;
-    }
-    padUpdate(&s_pad);
-    b = padGetButtons(&s_pad);
-    l = padGetStickPos(&s_pad, 0);
-    r = padGetStickPos(&s_pad, 1);
+    if (!s_ready)
+        nx_pad_init();
+    padUpdate(pad);
+    b = padGetButtons(pad);
+    l = padGetStickPos(pad, 0);
+    r = padGetStickPos(pad, 1);
+    style = padGetStyleSet(pad);
     mutexUnlock(&s_lock);
 
-    if (!padIsConnected(&s_pad))
+    if (!padIsConnected(pad))
         return 0;
+
+    /* A single Joy-Con (single mode): sideways, one stick. */
+    if (!(style & (HidNpadStyleTag_NpadFullKey | HidNpadStyleTag_NpadHandheld
+                   | HidNpadStyleTag_NpadJoyDual))
+            && (style & (HidNpadStyleTag_NpadJoyLeft | HidNpadStyleTag_NpadJoyRight))) {
+        nx_sideways(style, &b, &l, l, r);
+        r.x = r.y = 0;
+    }
 
     *digital = 0;
     if (b & HidNpadButton_Up)     *digital |= 0x0001;
@@ -139,9 +221,12 @@ static int nx_rumble_refresh(NxRumbleTarget *t, int active)
 
 void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right)
 {
-    static NxRumbleTarget targets[2] = {
-        { HidNpadIdType_Handheld, 0, 0, {{0}} },
-        { HidNpadIdType_No1,      0, 0, {{0}} },
+    /* Player 1: handheld and No1; player 2: No2. */
+    static NxRumbleTarget targets[NX_PADS][2] = {
+        { { HidNpadIdType_Handheld, 0, 0, {{0}} },
+          { HidNpadIdType_No1,      0, 0, {{0}} } },
+        { { HidNpadIdType_No2,      0, 0, {{0}} },
+          { HidNpadIdType_No2,      0, 0, {{0}} } },
     };
     static int disabled = -1;
     HidVibrationDeviceHandle handles[4];
@@ -151,7 +236,7 @@ void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right)
     s32 n = 0;
     int i, k;
 
-    if (port != 0)
+    if (port >= NX_PADS)
         return;
     if (disabled < 0) {
         const char *e = getenv("RECOMP_RUMBLE");
@@ -165,8 +250,13 @@ void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right)
         mutexUnlock(&s_lock);
         return;
     }
-    active[0] = padIsHandheld(&s_pad);
-    active[1] = padIsNpadActive(&s_pad, HidNpadIdType_No1);
+    if (port == 0) {
+        active[0] = padIsHandheld(&s_pad[0]);
+        active[1] = padIsNpadActive(&s_pad[0], HidNpadIdType_No1);
+    } else {
+        active[0] = padIsConnected(&s_pad[1]);
+        active[1] = 0;
+    }
 
     /* Standard HD rumble resonances: 160 Hz low band, 320 Hz high band. */
     v.amp_low   = (float)left  / 65535.0f;
@@ -174,9 +264,9 @@ void xbox_nx_pad_rumble(unsigned port, uint16_t left, uint16_t right)
     v.amp_high  = (float)right / 65535.0f;
     v.freq_high = 320.0f;
     for (i = 0; i < 2; i++) {
-        int c = nx_rumble_refresh(&targets[i], active[i]);
+        int c = nx_rumble_refresh(&targets[port][i], active[i]);
         for (k = 0; k < c; k++) {
-            handles[n] = targets[i].handles[k];
+            handles[n] = targets[port][i].handles[k];
             values[n] = v;
             n++;
         }

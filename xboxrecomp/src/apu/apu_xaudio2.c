@@ -265,6 +265,8 @@ static int               g_sdla_target = SDLA_DEFAULT_BLOCKS;
 static int               g_sdla_frames_written = 0;
 static Xa2Stats          g_sdla_stats;
 
+static void dump_init(void);
+
 int xa2_init(void)
 {
     SDL_AudioSpec want, have;
@@ -302,6 +304,7 @@ int xa2_init(void)
         return 0;
     }
     SDL_PauseAudioDevice(g_sdla_dev, 0);
+    dump_init();
 
     g_sdla_frames_written = 0;
     fprintf(stderr, "[AUDIO] SDL %s output: %d Hz, %d ch, %d-sample device buffer,"
@@ -340,6 +343,66 @@ int xa2_queue_target(void)
     return g_sdla_target;
 }
 
+/* RECOMP_AUDIO_DUMP=<path>,<start s>,<seconds>: the exact PCM handed to the
+ * device (48 kHz s16 stereo, after volume and limiter), from <start> seconds
+ * after the device opened, kept in RAM and written in one go when full -- a
+ * console capture to compare with a Linux one (SD writes while playing would
+ * disturb what is being measured). */
+static struct {
+    int      on;
+    FILE    *f;
+    char     path[256];
+    uint64_t skip, left;                /* samples */
+    int16_t *buf;
+    size_t   n, cap;                    /* int16 values */
+} s_dump;
+
+static void dump_init(void)
+{
+    const char *e = getenv("RECOMP_AUDIO_DUMP");
+    char *c1, *c2;
+    if (!e || !*e) return;
+    snprintf(s_dump.path, sizeof s_dump.path, "%s", e);
+    c1 = strchr(s_dump.path, ',');
+    c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+    if (!c1 || !c2) return;
+    *c1 = 0;
+    s_dump.skip = (uint64_t)atoi(c1 + 1) * SDLA_SAMPLE_RATE;
+    s_dump.left = (uint64_t)atoi(c2 + 1) * SDLA_SAMPLE_RATE;
+    s_dump.cap = (size_t)s_dump.left * SDLA_CHANNELS;
+    s_dump.buf = s_dump.cap ? (int16_t *)malloc(s_dump.cap * sizeof(int16_t)) : NULL;
+    if (!s_dump.buf) return;
+    s_dump.on = 1;
+    fprintf(stderr, "[AUDIO] dump: %llu s from %llu s to %s\n",
+            (unsigned long long)(s_dump.left / SDLA_SAMPLE_RATE),
+            (unsigned long long)(s_dump.skip / SDLA_SAMPLE_RATE), s_dump.path);
+}
+
+static void dump_block(const int16_t *pcm, int num_samples)
+{
+    size_t take;
+    if (!s_dump.on) return;
+    if (s_dump.skip >= (uint64_t)num_samples) { s_dump.skip -= num_samples; return; }
+    pcm += s_dump.skip * SDLA_CHANNELS;
+    num_samples -= (int)s_dump.skip;
+    s_dump.skip = 0;
+    take = (size_t)num_samples * SDLA_CHANNELS;
+    if (take > s_dump.cap - s_dump.n) take = s_dump.cap - s_dump.n;
+    memcpy(s_dump.buf + s_dump.n, pcm, take * sizeof(int16_t));
+    s_dump.n += take;
+    if (s_dump.n < s_dump.cap) return;
+    s_dump.on = 0;
+    s_dump.f = fopen(s_dump.path, "wb");
+    if (s_dump.f) {
+        fwrite(s_dump.buf, sizeof(int16_t), s_dump.n, s_dump.f);
+        fclose(s_dump.f);
+    }
+    fprintf(stderr, "[AUDIO] dump written: %s (%zu bytes)%s\n", s_dump.path,
+            s_dump.n * sizeof(int16_t), s_dump.f ? "" : " -- open failed");
+    free(s_dump.buf);
+    s_dump.buf = NULL;
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     int16_t buf[SDLA_MAX_SAMPLES * SDLA_CHANNELS];
@@ -369,6 +432,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     g_sdla_stats.samples += (uint64_t)num_samples;
     apu_output_safety(samples, buf, n);
+    dump_block(buf, num_samples);
 
     if (SDL_QueueAudio(g_sdla_dev, buf, (Uint32)(n * sizeof(int16_t))) != 0)
         return 0;

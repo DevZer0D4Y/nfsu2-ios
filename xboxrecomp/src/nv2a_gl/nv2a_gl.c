@@ -27,8 +27,9 @@
  *   RECOMP_GL_TRACE=1                shader sources and link errors
  *   RECOMP_GL_WATCH=<hex va>         state, vertices and pixels read back for
  *                                    the first draws into / sampling that VA
- *   RECOMP_GL_SCALE=1|2|4            render surfaces at that multiple of the
- *                                    title's resolution (default 1)
+ *   RECOMP_GL_SCALE=<k>              render surfaces at k times the title's
+ *                                    resolution, fractions allowed (1.5;
+ *                                    0.5..4, default 1)
  *   RECOMP_GL_SHARED_Z=0             depth buffer per colour surface instead of
  *                                    per zeta address (the old behaviour)
  */
@@ -164,12 +165,19 @@ typedef struct {
 static GlDepth s_depth[GL_MAX_DEPTH];
 static int     s_shared_z = -1;         /* RECOMP_GL_SHARED_Z=0: old behaviour */
 
-/* RECOMP_GL_SCALE: render resolution multiple (1, 2 or 4). Everything the
- * title sees stays at its own size; only the pixels behind a surface grow,
- * so the viewport, clear rectangles, read-backs and the present blit scale
- * and nothing else does. Capped per surface by the driver's size limit. */
-static uint32_t s_scale = 1;
-static GLint    s_max_size = 4096;
+/* RECOMP_GL_SCALE: render resolution multiple (0.5..4, fractions allowed).
+ * Everything the title sees stays at its own size; only the pixels behind a
+ * surface grow, so the viewport, clear rectangles, read-backs and the
+ * present blit scale and nothing else does. Capped per surface by the
+ * driver's size limit. */
+static double s_scale = 1.0;
+static GLint  s_max_size = 4096;
+
+/* v title pixels of a surface l wide, in the p stored pixels behind it. */
+static GLint to_stored(uint32_t v, uint32_t p, uint32_t l)
+{
+    return (GLint)(((uint64_t)v * p + l / 2) / l);
+}
 
 #define GL_MAX_SURF 32
 static GlSurf  s_surf[GL_MAX_SURF];
@@ -215,10 +223,12 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
     {
-        uint32_t k = s_scale;
-        while (k > 1 && (w * k > (uint32_t)s_max_size || h * k > (uint32_t)s_max_size))
-            k >>= 1;
-        s->pw = w * k; s->ph = h * k;
+        double k = s_scale, m = (double)(w > h ? w : h);
+        if (m * k > (double)s_max_size)
+            k = (double)s_max_size / m;
+        s->pw = (uint32_t)(w * k + 0.5); s->ph = (uint32_t)(h * k + 0.5);
+        if (!s->pw) s->pw = 1;
+        if (!s->ph) s->ph = 1;
     }
     glGenTextures(1, &s->tex);
     tex_param_forget(s->tex);
@@ -1076,13 +1086,14 @@ static int ready(void)
     {
         const char *e = getenv("RECOMP_GL_SCALE");
         GLint mt = 0, mr = 0;
-        int k = e ? atoi(e) : 1;
-        s_scale = k >= 4 ? 4 : k >= 2 ? 2 : 1;
+        double k = e ? strtod(e, NULL) : 1.0;
+        if (!(k > 0.0)) k = 1.0;                    /* unset, 0 or garbage */
+        s_scale = k < 0.5 ? 0.5 : k > 4.0 ? 4.0 : k;
         glGetIntegerv(0x0D33, &mt);                 /* GL_MAX_TEXTURE_SIZE */
         glGetIntegerv(0x84E8, &mr);                 /* GL_MAX_RENDERBUFFER_SIZE */
         s_max_size = mt > 0 && mr > 0 ? (mt < mr ? mt : mr) : 4096;
-        if (s_scale > 1)
-            fprintf(stderr, "  [GL] rendering at %ux (RECOMP_GL_SCALE), surfaces up to %d\n",
+        if (s_scale != 1.0)
+            fprintf(stderr, "  [GL] rendering at %gx (RECOMP_GL_SCALE), surfaces up to %d\n",
                     s_scale, s_max_size);
     }
     {
@@ -1711,7 +1722,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                     for (q = 0; q < 4; q++) {
                         GLint xx = (GLint)u0 + 4 + q * 8, yy = (GLint)v0 + 4 + q * 8;
                         if (xx < 0 || yy < 0 || xx >= (GLint)src->w || yy >= (GLint)src->h) continue;
-                        glReadPixels(xx * (GLint)(src->pw / src->w), yy * (GLint)(src->ph / src->h), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                        glReadPixels(to_stored((uint32_t)xx, src->pw, src->w), to_stored((uint32_t)yy, src->ph, src->h), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
                         fprintf(stderr, " %02X%02X%02X%02X", px[0], px[1], px[2], px[3]);
                     }
                     fprintf(stderr, "\n");
@@ -1837,7 +1848,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             for (q = 0; q < 4; q++) {
                 GLint xx = (GLint)(x0 + 0.5f) + 4 + q * 8, yy = (GLint)(y0 + 0.5f) + 4 + q * 8;
                 if (xx < 0 || yy < 0 || xx >= (GLint)s->w || yy >= (GLint)s->h) continue;
-                glReadPixels(xx * (GLint)(s->pw / s->w), yy * (GLint)(s->ph / s->h), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                glReadPixels(to_stored((uint32_t)xx, s->pw, s->w), to_stored((uint32_t)yy, s->ph, s->h), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
                 fprintf(stderr, " %02X%02X%02X%02X", px[0], px[1], px[2], px[3]);
             }
             fprintf(stderr, "\n");
@@ -1871,10 +1882,10 @@ static void gl_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (x1 > s->w) x1 = s->w;
         if (y1 > s->h) y1 = s->h;
         if (x1 > x0 && y1 > y0 && (x1 - x0 < s->w || y1 - y0 < s->h)) {
-            uint32_t kx = s->pw / s->w, ky = s->ph / s->h;
+            GLint px0 = to_stored(x0, s->pw, s->w), py0 = to_stored(y0, s->ph, s->h);
             glEnable(GL_SCISSOR_TEST);
-            glScissor((GLint)(x0 * kx), (GLint)(y0 * ky), (GLsizei)((x1 - x0) * kx),
-                      (GLsizei)((y1 - y0) * ky));
+            glScissor(px0, py0, to_stored(x1, s->pw, s->w) - px0,
+                      to_stored(y1, s->ph, s->h) - py0);
         }
     }
     if (flags & 0xF0) {

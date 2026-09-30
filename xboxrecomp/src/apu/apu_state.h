@@ -472,6 +472,7 @@ struct MCPXAPUState {
     bool pause_requested;
     bool is_idle;
     volatile LONG lock_waiters;   /* guest-side threads in mcpx_apu_lock_guest */
+    bool in_trap;                 /* front end trapped/halted: time stopped */
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
@@ -514,9 +515,10 @@ struct MCPXAPUState {
  * (DirectSound's voice commands, reached with the guest lock and often the
  * dispatch lock held) waiting for it stalled the whole game: while the APU
  * ran behind -- many voices at once, e.g. crash sounds -- the frame thread
- * never released it (throttle() lets go only when ahead, one frame in 8)
- * and Horizon's mutexes are not fair. Guest-side takers announce
- * themselves here; the frame thread hands the lock over after its frame. */
+ * never released it (throttle() lets go only when ahead, one frame in 8).
+ * Guest-side takers announce themselves here; the frame thread hands the
+ * lock over after its frame, and waits until they have it -- so keep this
+ * off hot paths (voice_lock sets its bits atomically instead). */
 static inline void mcpx_apu_lock_guest(MCPXAPUState *d)
 {
     InterlockedIncrement(&d->lock_waiters);

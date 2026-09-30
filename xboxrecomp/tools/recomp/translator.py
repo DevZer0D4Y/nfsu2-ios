@@ -1564,6 +1564,7 @@ class FunctionTranslator:
             "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
             "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
             "leave": {"esp", "ebp"}, "popad": set(full_registers),
+            "popal": set(full_registers),
             "xlat": {"eax"}, "xlatb": {"eax"},
         }
 
@@ -2152,6 +2153,10 @@ class FunctionTranslator:
         # Ensure ebp tracked if function uses 'leave' (implicit ebp)
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
+        # pushad/popad name all eight registers without operands.
+        if any(insn.mnemonic in ("pushal", "popal", "pushad", "popad")
+               for insn in instructions):
+            used_regs |= {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
 
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter

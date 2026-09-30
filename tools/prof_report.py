@@ -66,8 +66,15 @@ def main():
     per = collections.defaultdict(lambda: (collections.Counter(), collections.Counter()))
     total = collections.Counter()
     stacks = collections.defaultdict(collections.Counter)
+    wraps, last_when = 0, 0
     for off in range(0, len(data) - 31, 32):
         slot, when, pc, lr, *ret = struct.unpack_from("<HHII5I", data, off)
+        # The time is 16 bits of 10 ms: it wraps every 655.36 s. Samples are
+        # written in order, so a big step back is a wrap.
+        if when + 30000 < last_when:
+            wraps += 1
+        last_when = when
+        when += wraps * 65536
         if t_from is not None and not (t_from <= when / 100.0 <= t_to):
             continue
         fn = name_of(addrs, names, pc)

@@ -604,6 +604,7 @@ static int gil_enabled(void)
  * would otherwise hold the lock against the very thread they wait for. */
 volatile int g_gil_contended;
 static RECOMP_TLS int t_gil_nopreempt;      /* inside an ISR or DPC */
+int xbox_thread_holds_dispatch(void);     /* kernel_hal.c */
 
 /* RECOMP_GIL_EAGER=1: hand the lock over by guest priority, the way the
  * Xbox's scheduler would, instead of FIFO with a 1 ms grace.
@@ -671,6 +672,11 @@ static void gil_lock(void)
         if ((prio >= GIL_CRITICAL && prio > s_gil_holder_prio)
             || (t_gil_main && prio >= s_gil_holder_prio))
             g_gil_contended = 1;
+    }
+    /* A thread at DISPATCH (an ISR/DPC, or a raised section) runs before
+     * anything below it on the Xbox: ask for the lock at once. */
+    if (me != s_gil_serving && xbox_thread_holds_dispatch()) {
+        g_gil_contended = 1;
     }
     while (me != s_gil_serving)
         if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
@@ -746,13 +752,15 @@ void recomp_spin_yield(void)
     xbox_gil_resume(d);
 }
 
-KIRQL xbox_CurrentIrql(void);
-
 /* RECOMP_PREEMPT: someone is waiting -- yield, unless this is an ISR or DPC
- * (which run to completion on the Xbox) or code at raised IRQL. */
+ * (which run to completion on the Xbox) or code this thread raised to
+ * DISPATCH. Not the global IRQL: the timer thread raises it before it
+ * queues for the lock to run a DPC, and the holder then never yielded to
+ * that DPC until its next kernel call (40% of the timer thread's time in
+ * traffic collisions). */
 void recomp_preempt(void)
 {
-    if (t_gil_depth <= 0 || t_gil_nopreempt || xbox_CurrentIrql() >= 2)
+    if (t_gil_depth <= 0 || t_gil_nopreempt || xbox_thread_holds_dispatch())
         return;
     recomp_spin_yield();
 }
@@ -1223,7 +1231,10 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Contiguous blocks come from their own arena; xbox_HeapFree does not
+     * know them (it used to be called here, and nothing was ever freed). */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -3336,7 +3347,9 @@ static void bridge_ExQueryPoolBlockSize(void)
      * answer. It used to return a literal 0 on the theory that this is only
      * ever used for stats -- which is a guess about the caller, and a title
      * that sizes a copy from it copies nothing. */
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(va);
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── RtlNtStatusToDosError (ordinal 301) ─────────────────
@@ -10033,7 +10046,9 @@ static int kernel_call_keeps_gil(int slot)
     if (!on || slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE)
         return 0;
     ord = g_slot_ordinals[slot];
-    return ord == 125 || ord == 126 || ord == 127 || ord == 128;   /* KeQuery* time */
+    return ord == 125 || ord == 126 || ord == 127 || ord == 128    /* KeQuery* time */
+        || ord == 103 || ord == 129 || ord == 130                    /* KeGetCurrentIrql, */
+        || ord == 160 || ord == 161;          /* KeRaiseIrqlTo*, KfRaise/LowerIrql */
 }
 
 static void kernel_thunk_dispatch(void)

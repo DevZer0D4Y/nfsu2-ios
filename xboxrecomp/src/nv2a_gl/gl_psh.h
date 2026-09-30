@@ -17,6 +17,9 @@ typedef struct {
     uint32_t other_input;      /* NV097_SET_SHADER_OTHER_STAGE_INPUT */
 } Nv2aPshKey;
 
+/* Nonzero: emit Vulkan GLSL (nv2a_vk) instead of GLSL 3.30 (gl_vsh.c). */
+extern int nv2a_shader_vk;
+
 /* Fragment shader source for `k`. Returns bytes written, -1 on overflow. */
 int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap);
 

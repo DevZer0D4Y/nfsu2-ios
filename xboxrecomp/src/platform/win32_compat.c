@@ -299,6 +299,12 @@ typedef struct w32_object {
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
+    int             host_rt;         /* host priority raised (host_priority_apply) */
+    int             host_base;       /* Linux: RT priority it started at */
+    volatile int    started;         /* Linux: o->thread is valid */
+#if defined(__SWITCH__)
+    Handle          nx_handle;       /* Horizon thread, once it runs */
+#endif
     PAPCFUNC        apc_func[W32_MAX_APC];
     ULONG_PTR       apc_data[W32_MAX_APC];
     int             apc_count;
@@ -1019,6 +1025,8 @@ void xbox_nx_track_thread(void *entry) { (void)entry; }
 void xbox_nx_retag_thread(void *entry) { (void)entry; }
 #endif
 
+static void host_priority_apply(w32_object *o);
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
@@ -1026,6 +1034,21 @@ static void *thread_trampoline(void *arg)
     xbox_nx_track_thread((void *)o->start);
     t_self_obj = o;
     t_tid      = o->tid;
+#if defined(__SWITCH__)
+    {
+        extern Handle threadGetCurHandle(void);   /* libnx */
+        o->nx_handle = threadGetCurHandle();
+    }
+#else
+    {
+        struct sched_param sp;
+        int pol;
+        if (pthread_getschedparam(pthread_self(), &pol, &sp) == 0)
+            o->host_base = sp.sched_priority;
+        o->started = 1;
+    }
+#endif
+    host_priority_apply(o);              /* a priority set before it ran */
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -1148,11 +1171,56 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
     return TRUE;
 }
 
+/* Opt-in (RECOMP_NX_GUEST_RT=1): a guest thread at TIME_CRITICAL gets a
+ * host priority that pre-empts. On Horizon every guest thread runs at 59,
+ * the one priority that time-slices, so a thread with a deadline can wait a
+ * 10 ms slice behind whatever shares its core. NFSU2's EA mixer (entry
+ * 0x00274CA0, the only thread the title raises to time critical) refills its
+ * DirectSound ring 5-15 ms ahead of the play cursor; late, the VP plays the
+ * ring's 50 ms old contents (counted as stale in the [perf] APU ring line).
+ * nfsmw-nx fixed the same with 0x2D for its audio server. Not the default:
+ * the guest lock is a FIFO ticket lock, so the priority does not move the
+ * mixer up its queue, and a pre-emptive thread that polls starves the
+ * runtime threads sharing its core. Under a Linux SCHED_RR test (one core,
+ * RR slices) it did not help. Elsewhere real RT priorities need privileges:
+ * only a process already under SCHED_RR/FIFO is bumped. */
+static void host_priority_apply(w32_object *o)
+{
+    const char *e = getenv("RECOMP_NX_GUEST_RT");
+    int rt = o->priority >= THREAD_PRIORITY_TIME_CRITICAL;
+    if (!(e && *e == '1') || rt == o->host_rt)
+        return;
+#if defined(__SWITCH__)
+    if (!o->nx_handle)
+        return;                          /* not running yet: the trampoline applies it */
+    if (R_SUCCEEDED(svcSetThreadPriority(o->nx_handle, rt ? 0x2D : 0x3B))) {
+        o->host_rt = rt;
+        fprintf(stderr, "  [NX] guest thread %p at host priority 0x%X\n",
+                (void *)o->start, rt ? 0x2D : 0x3B);
+    }
+#else
+    {
+        struct sched_param sp;
+        int pol;
+        pthread_t th = (o == t_self_obj) ? pthread_self() : o->thread;
+        if (!o->started || pthread_getschedparam(th, &pol, &sp) ||
+            (pol != SCHED_RR && pol != SCHED_FIFO))
+            return;
+        sp.sched_priority = o->host_base + (rt ? 1 : 0);
+        if (pthread_setschedparam(th, pol, &sp) == 0)
+            o->host_rt = rt;
+    }
+#endif
+}
+
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_from(h);
-    if (o && o->kind == K_THREAD) o->priority = priority;
-    return TRUE;   /* real RT priorities need privileges; tracked only */
+    if (o && o->kind == K_THREAD) {
+        o->priority = priority;
+        host_priority_apply(o);
+    }
+    return TRUE;
 }
 
 int GetThreadPriority(HANDLE h)

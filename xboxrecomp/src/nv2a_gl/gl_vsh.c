@@ -231,8 +231,72 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
  * helpers (same constants as the interpreter), and the three position
  * paths. u_xform selects the path at run time so one program object serves
  * a vertex program under any surface. */
+/* Vulkan GLSL (nv2a_vk): the same shader with explicit locations, the
+ * uniforms in a std140 block (binding 0) and Vulkan's 0..1 clip depth. */
+static const char s_vk_prelude[] =
+    "#version 450\n"
+    "layout(location = 0) in vec4 v0;\n"
+    "layout(location = 1) in vec4 v1;\n"
+    "layout(location = 2) in vec4 v2;\n"
+    "layout(location = 3) in vec4 v3;\n"
+    "layout(location = 4) in vec4 v4;\n"
+    "layout(location = 5) in vec4 v5;\n"
+    "layout(location = 6) in vec4 v6;\n"
+    "layout(location = 7) in vec4 v7;\n"
+    "layout(location = 8) in vec4 v8;\n"
+    "layout(location = 9) in vec4 v9;\n"
+    "layout(location = 10) in vec4 v10;\n"
+    "layout(location = 11) in vec4 v11;\n"
+    "layout(location = 12) in vec4 v12;\n"
+    "layout(location = 13) in vec4 v13;\n"
+    "layout(location = 14) in vec4 v14;\n"
+    "layout(location = 15) in vec4 v15;\n"
+    "layout(std140, set = 0, binding = 0) uniform VsU {\n"
+    "    vec4 c[192];\n"
+    "    vec4 u_surf;\n"
+    "    vec4 u_m[4];\n"
+    "    vec4 u_vpoff;\n"
+    "    vec2 u_aa;\n"
+    "    int u_xform;\n"
+    "};\n"
+    "layout(location = 0) out vec4 vD0; layout(location = 1) out vec4 vD1;\n"
+    "layout(location = 2) out vec4 vT0; layout(location = 3) out vec4 vT1;\n"
+    "layout(location = 4) out vec4 vT2; layout(location = 5) out vec4 vT3;\n"
+    "layout(location = 6) out float vFog;\n"
+    "vec4 R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11;\n"
+    "vec4 oPos, o1, o2, oD0, oD1, oFog, oPts, oB0, oB1, oT0, oT1, oT2, oT3;\n"
+    "float nv2a_rcp(float x) { return x != 0.0 ? 1.0 / x : 1.884467e+19; }\n"
+    "float nv2a_rcc(float x) {\n"
+    "    float y = nv2a_rcp(x); float a = clamp(abs(y), 5.42101e-20, 1.884467e+19);\n"
+    "    return y < 0.0 ? -a : a;\n"
+    "}\n"
+    "vec4 nv2a_exp(float x) { float f = floor(x); return vec4(exp2(f), x - f, exp2(x), 1.0); }\n"
+    "vec4 nv2a_log(float x) {\n"
+    "    float a = abs(x);\n"
+    "    if (a == 0.0) return vec4(-1.884467e+19, 1.0, -1.884467e+19, 1.0);\n"
+    "    float e = floor(log2(a));\n"
+    "    return vec4(e, a / exp2(e), log2(a), 1.0);\n"
+    "}\n"
+    "vec4 nv2a_lit(vec4 s) {\n"
+    "    float lx = max(s.x, 0.0), ly = max(s.y, 0.0), w = clamp(s.w, -127.996, 127.996);\n"
+    "    return vec4(1.0, lx, (lx > 0.0 && ly > 0.0) ? exp2(w * log2(ly)) : 0.0, 1.0);\n"
+    "}\n"
+    /* z clamped only in front of the eye (w > 0). Behind it (w < 0) the
+     * vertex is clipped by x/y anyway and its true z is about w: clamping it
+     * to 0 skewed the interpolated depth of triangles crossing the eye plane
+     * (walls in hood view turned transparent, objects showed through them). */
+    "vec4 nv2a_clip(vec3 sw, float w) {\n"
+    "    float z = sw.z * u_surf.z;\n"
+    "    return vec4(sw.x * u_surf.x - w, sw.y * u_surf.y - w,\n"
+    "                w > 0.0 ? clamp(z, 0.0, w) : z, w);\n"
+    "}\n";
+
+int nv2a_shader_vk;
+
 const char *nv2a_gl_vsh_prelude(void)
 {
+    if (nv2a_shader_vk)
+        return s_vk_prelude;
     return
         "#version 330 core\n"
         "layout(location = 0) in vec4 v0;\n"
@@ -307,7 +371,9 @@ const char *nv2a_gl_vsh_main_program(void)
 
 const char *nv2a_gl_vsh_fixed(void)
 {
-    return
+    /* Vulkan: u_xform is a member of the prelude's uniform block. */
+    static const char decl[] = "uniform int u_xform;      /* 0 pre-transformed, 1 fixed-function */\n";
+    static const char body[] =
         "uniform int u_xform;      /* 0 pre-transformed, 1 fixed-function */\n"
         "void main() {\n"
         "    if (u_xform == 1) {\n"
@@ -324,4 +390,5 @@ const char *nv2a_gl_vsh_fixed(void)
         "    vD0 = clamp(v3, 0.0, 1.0); vD1 = clamp(v4, 0.0, 1.0);\n"
         "    vT0 = v9; vT1 = v10; vT2 = v11; vT3 = v12; vFog = 0.0;\n"
         "}\n";
+    return nv2a_shader_vk ? body + sizeof decl - 1 : body;
 }

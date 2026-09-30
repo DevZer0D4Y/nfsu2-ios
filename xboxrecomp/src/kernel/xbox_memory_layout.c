@@ -3431,9 +3431,16 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
+ *
+ * Freed blocks are reused (first fit, coalesced). The arena used to be a bump
+ * pointer that MmFreeContiguousMemory never gave back -- it called
+ * xbox_HeapFree, which does not know these addresses. NFSU2 allocates its
+ * textures and frame buffers here (XPhysicalAlloc) and frees them on every
+ * switch between the garage and the world; after ~20 minutes of Career the
+ * 64 MB window was full, a 16 KB request failed while leaving the car lot and
+ * the game hung on the loading screen. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+static uint32_t g_contig_hwm = XBOX_CONTIG_BASE;   /* highest end ever handed out */
 
 /* Where the arena starts: just above the loaded image, not at the window base.
  *
@@ -3447,43 +3454,212 @@ static uint32_t g_contig_next = XBOX_CONTIG_BASE;
  * ranges disjoint: xbox_ContiguousIsPhysical() then answers exactly. */
 static uint32_t g_contig_start = XBOX_CONTIG_BASE;
 
+/* Block table, address order, covering [g_contig_start, g_contig_next).
+ * A freed block that reaches g_contig_next is dropped and the pointer moves
+ * back, so the table holds only what is below the top. */
+#define XBOX_CONTIG_MAX_BLOCKS 16384
+static struct { uint32_t addr, size; uint8_t free; }
+    g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static int g_contig_count;
+static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+
+static int contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
+{
+    if (g_contig_count >= XBOX_CONTIG_MAX_BLOCKS)
+        return 0;
+    memmove(&g_contig_blocks[at + 1], &g_contig_blocks[at],
+            (size_t)(g_contig_count - at) * sizeof g_contig_blocks[0]);
+    g_contig_blocks[at].addr = addr;
+    g_contig_blocks[at].size = size;
+    g_contig_blocks[at].free = (uint8_t)is_free;
+    g_contig_count++;
+    return 1;
+}
+
+static void contig_remove(int at)
+{
+    memmove(&g_contig_blocks[at], &g_contig_blocks[at + 1],
+            (size_t)(g_contig_count - at - 1) * sizeof g_contig_blocks[0]);
+    g_contig_count--;
+}
+
+/* Index of the block starting at addr, or -1. */
+static int contig_find(uint32_t addr)
+{
+    int lo = 0, hi = g_contig_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_contig_blocks[mid].addr == addr) return mid;
+        if (g_contig_blocks[mid].addr < addr) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}
+
+/* Take [start, start+size) out of free block i. Returns 0 if the table is full. */
+static int contig_carve(int i, uint32_t start, uint32_t size)
+{
+    uint32_t a = g_contig_blocks[i].addr;
+    uint32_t end = a + g_contig_blocks[i].size;
+    uint32_t front = start - a, back = end - (start + size);
+
+    if ((front != 0) + (back != 0) > XBOX_CONTIG_MAX_BLOCKS - g_contig_count)
+        return 0;
+    if (front) {
+        g_contig_blocks[i].size = front;
+        contig_insert(++i, start, size, 0);
+    } else {
+        g_contig_blocks[i].size = size;
+        g_contig_blocks[i].free = 0;
+    }
+    if (back)
+        contig_insert(i + 1, start + size, back, 1);
+    return 1;
+}
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
-    uint32_t result;
+    uint32_t result = 0;
+    int i;
 
+    if (!size) size = 1;
+    size = (size + 4095u) & ~4095u;
+    if (alignment < 4096) alignment = 4096;
+
+    AcquireSRWLockExclusive(&g_contig_lock);
     if (g_contig_next == XBOX_CONTIG_BASE && g_xbox_image_hi) {
         g_contig_start = XBOX_CONTIG_BASE + ((g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu);
-        g_contig_next = g_contig_start;
-    }
-    if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
-
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
-        fflush(stderr);
-        return 0;
+        g_contig_next = g_contig_hwm = g_contig_start;
     }
 
-    g_contig_next = result + size;
-    xbox_ContiguousSetPhysicalRange(g_contig_start - XBOX_CONTIG_BASE,
-                                    g_contig_next  - XBOX_CONTIG_BASE);
+    /* First fit among freed blocks. */
+    for (i = 0; i < g_contig_count; i++) {
+        uint32_t a, start;
+        if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size)
+            continue;
+        a = g_contig_blocks[i].addr;
+        start = (a + alignment - 1) & ~(alignment - 1);
+        if ((uint64_t)start + size > (uint64_t)a + g_contig_blocks[i].size)
+            continue;
+        if (contig_carve(i, start, size))
+            result = start;
+        break;
+    }
+
+    if (!result) {
+        uint32_t gap_at = g_contig_next;
+        result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+
+        /* Leave the top of the window for GPU instance memory. */
+        if ((uint64_t)result + size >
+                (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                    - XBOX_GPU_INSTANCE_DEFAULT
+            || g_contig_count + 2 > XBOX_CONTIG_MAX_BLOCKS) {
+            uint32_t free_bytes = 0, largest = 0;
+            for (i = 0; i < g_contig_count; i++)
+                if (g_contig_blocks[i].free) {
+                    free_bytes += g_contig_blocks[i].size;
+                    if (g_contig_blocks[i].size > largest)
+                        largest = g_contig_blocks[i].size;
+                }
+            ReleaseSRWLockExclusive(&g_contig_lock);
+            fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used, "
+                    "%u free below the top in %d blocks, largest %u)\n",
+                    size, g_contig_next - XBOX_CONTIG_BASE,
+                    (unsigned)XBOX_CONTIG_SIZE, free_bytes, g_contig_count, largest);
+            fflush(stderr);
+            return 0;
+        }
+        /* An alignment gap becomes a free block of its own. */
+        if (result > gap_at) {
+            if (g_contig_count && g_contig_blocks[g_contig_count - 1].free)
+                g_contig_blocks[g_contig_count - 1].size += result - gap_at;
+            else
+                contig_insert(g_contig_count, gap_at, result - gap_at, 1);
+        }
+        contig_insert(g_contig_count, result, size, 0);
+        g_contig_next = result + size;
+        if (g_contig_next > g_contig_hwm) {
+            g_contig_hwm = g_contig_next;
+            /* The published range only grows: a device may still hold a
+             * physical address from a block that has since been freed. */
+            xbox_ContiguousSetPhysicalRange(g_contig_start - XBOX_CONTIG_BASE,
+                                            g_contig_hwm   - XBOX_CONTIG_BASE);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_contig_lock);
+
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 
-/* How much of the window has been handed out.
+/* MmFreeContiguousMemory. Returns 0 for an address the arena never handed
+ * out (a pinned physical block, or a heap pointer), which is then ignored. */
+int xbox_ContiguousFree(uint32_t va)
+{
+    int i;
+
+    AcquireSRWLockExclusive(&g_contig_lock);
+    i = contig_find(va);
+    if (i < 0 || g_contig_blocks[i].free) {
+        ReleaseSRWLockExclusive(&g_contig_lock);
+        return 0;
+    }
+    g_contig_blocks[i].free = 1;
+    if (i + 1 < g_contig_count && g_contig_blocks[i + 1].free) {
+        g_contig_blocks[i].size += g_contig_blocks[i + 1].size;
+        contig_remove(i + 1);
+    }
+    if (i > 0 && g_contig_blocks[i - 1].free) {
+        g_contig_blocks[i - 1].size += g_contig_blocks[i].size;
+        contig_remove(i);
+        i--;
+    }
+    if (i == g_contig_count - 1) {           /* the top block: give it back */
+        g_contig_next = g_contig_blocks[i].addr;
+        g_contig_count--;
+    }
+    {
+        static unsigned frees;
+        uint32_t top = g_contig_next - XBOX_CONTIG_BASE;
+        int blocks = g_contig_count;
+        ReleaseSRWLockExclusive(&g_contig_lock);
+        if (++frees <= 4 || frees % 256 == 0) {
+            fprintf(stderr, "  [CONTIG] free #%u va=0x%08X (top %u KB, %d blocks)\n",
+                    frees, va, top / 1024, blocks);
+            fflush(stderr);
+        }
+    }
+    return 1;
+}
+
+/* Size of the live contiguous block containing va, or 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t va)
+{
+    uint32_t r = 0;
+    int lo = 0, hi;
+
+    AcquireSRWLockShared(&g_contig_lock);
+    hi = g_contig_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint32_t a = g_contig_blocks[mid].addr;
+        if (va < a) hi = mid - 1;
+        else if (va - a >= g_contig_blocks[mid].size) lo = mid + 1;
+        else { if (!g_contig_blocks[mid].free) r = g_contig_blocks[mid].size; break; }
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return r;
+}
+
+/* How much of the window has been handed out (the high-water mark).
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return g_contig_hwm - XBOX_CONTIG_BASE;
 }
 
 /* xbox_ContiguousIsPhysical lives in xbox_devbus.c, where a device model can

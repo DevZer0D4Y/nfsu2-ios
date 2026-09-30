@@ -50,10 +50,16 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
-static uint8_t s_address;
-static uint8_t s_configuration;
+static uint8_t s_address[USB_GAMEPADS];
+static uint8_t s_configuration[USB_GAMEPADS];
 
-uint8_t usb_gamepad_address(void) { return s_address; }
+uint8_t usb_gamepad_address(int dev) { return s_address[dev]; }
+
+void usb_gamepad_reset(int dev)
+{
+    s_address[dev] = 0;
+    s_configuration[dev] = 0;
+}
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -80,7 +86,7 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
     return len;
 }
 
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
+int usb_gamepad_control(int dev, const UsbSetup *setup, uint8_t *out, int max)
 {
     int is_in = (setup->bmRequestType & 0x80) != 0;
     int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
@@ -105,16 +111,16 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
             }
 
         case REQ_SET_ADDRESS:
-            s_address = (uint8_t)(setup->wValue & 0x7F);
+            s_address[dev] = (uint8_t)(setup->wValue & 0x7F);
             return 0;                    /* zero-length status stage */
 
         case REQ_SET_CONFIGURATION:
-            s_configuration = (uint8_t)(setup->wValue & 0xFF);
+            s_configuration[dev] = (uint8_t)(setup->wValue & 0xFF);
             return 0;
 
         case REQ_GET_CONFIGURATION:
             if (!is_in || max < 1) return -1;
-            out[0] = s_configuration;
+            out[0] = s_configuration[dev];
             return 1;
 
         case REQ_GET_STATUS:
@@ -151,7 +157,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         && setup->bRequest == 0x01u                    /* GET_REPORT */
         && is_in) {
         uint8_t report[20];
-        int n = usb_gamepad_report(report, (int)sizeof report);
+        int n = usb_gamepad_report(dev, report, (int)sizeof report);
         if (n <= 0)
             return -1;
         return copy_out(out, max, report, n, setup->wLength);
@@ -294,14 +300,18 @@ static uint8_t synthetic_buttons(void)
  * report the title reads (so boot-time variance does not shift the script).
  * Buttons, joined with '+': up down left right start back lthumb rthumb
  * (digital) and a b x y black white lt rt (analog, pressed fully).
- * Up to 64 steps. */
+ * Up to 64 steps. RECOMP_PAD2_SCRIPT drives the second pad the same way
+ * (and keeps it plugged in), with times from the first pad's first read. */
 #define PAD_SCRIPT_MAX 64
-static struct { unsigned at, hold; uint8_t digital; uint8_t analog; } s_script[PAD_SCRIPT_MAX];
-static int s_script_n = -1;
+typedef struct { unsigned at, hold; uint8_t digital; uint8_t analog; } PadStep;
+static PadStep s_script_steps[USB_GAMEPADS][PAD_SCRIPT_MAX];
+static int s_script_count[USB_GAMEPADS] = { -1, -1 };
 static unsigned long s_script_t0;
 
-static void pad_script_parse(void)
+static void pad_script_parse(int dev)
 {
+    PadStep *steps = s_script_steps[dev];
+    int n;
     static const struct { const char *name; uint8_t digital, analog; } names[] = {
         { "up", 0x01, 0 }, { "down", 0x02, 0 }, { "left", 0x04, 0 },
         { "right", 0x08, 0 }, { "start", 0x10, 0 }, { "back", 0x20, 0 },
@@ -310,11 +320,11 @@ static void pad_script_parse(void)
         { "black", 0, 0x10 }, { "white", 0, 0x20 }, { "lt", 0, 0x40 },
         { "rt", 0, 0x80 },
     };
-    const char *spec = getenv("RECOMP_PAD_SCRIPT");
+    const char *spec = getenv(dev ? "RECOMP_PAD2_SCRIPT" : "RECOMP_PAD_SCRIPT");
     const char *p = spec;
 
-    s_script_n = 0;
-    while (p && *p && s_script_n < PAD_SCRIPT_MAX) {
+    n = 0;
+    while (p && *p && n < PAD_SCRIPT_MAX) {
         char *end;
         unsigned at = (unsigned)strtoul(p, &end, 10);
         uint8_t dig = 0, ana = 0;
@@ -337,48 +347,71 @@ static void pad_script_parse(void)
         }
         if (*p != ':')
             break;
-        s_script[s_script_n].at = at;
-        s_script[s_script_n].hold = (unsigned)strtoul(p + 1, &end, 10);
-        s_script[s_script_n].digital = dig;
-        s_script[s_script_n].analog = ana;
-        s_script_n++;
+        steps[n].at = at;
+        steps[n].hold = (unsigned)strtoul(p + 1, &end, 10);
+        steps[n].digital = dig;
+        steps[n].analog = ana;
+        n++;
         p = (*end == ',') ? end + 1 : NULL;
     }
-    if (s_script_n) {
-        fprintf(stderr, "  PAD: script with %d step(s)\n", s_script_n);
+    if (n) {
+        fprintf(stderr, "  PAD%d: script with %d step(s)\n", dev + 1, n);
         fflush(stderr);
     }
+    s_script_count[dev] = n;
 }
 
-static void pad_script(uint8_t *digital, uint8_t *analog)
+static void pad_script(int dev, uint8_t *digital, uint8_t *analog)
 {
+    const PadStep *steps = s_script_steps[dev];
     unsigned long now;
     int i;
 
-    if (s_script_n < 0)
-        pad_script_parse();
-    if (!s_script_n)
-        return;
     now = (unsigned long)GetTickCount();
-    if (!s_script_t0)
+    if (!s_script_t0) {
+        if (dev)
+            return;                     /* the clock starts with pad 1 */
         s_script_t0 = now;
+    }
+    if (s_script_count[dev] < 0)
+        pad_script_parse(dev);
+    if (!s_script_count[dev])
+        return;
     now -= s_script_t0;
-    for (i = 0; i < s_script_n; i++) {
-        if (now >= s_script[i].at && now < s_script[i].at + s_script[i].hold) {
+    for (i = 0; i < s_script_count[dev]; i++) {
+        if (now >= steps[i].at && now < steps[i].at + steps[i].hold) {
+            static uint64_t shown[USB_GAMEPADS];
             int b;
-            *digital |= s_script[i].digital;
+            if (i < 64 && !(shown[dev] & (1ull << i))) {
+                shown[dev] |= 1ull << i;
+                fprintf(stderr, "  PAD%d: step %d at %lu ms\n", dev + 1, i, now);
+                fflush(stderr);
+            }
+            *digital |= steps[i].digital;
             for (b = 0; b < 8; b++)
-                if (s_script[i].analog & (1u << b))
+                if (steps[i].analog & (1u << b))
                     analog[b] = 0xFF;
         }
     }
 }
 
-int usb_gamepad_report(uint8_t *out, int max)
+int usb_gamepad_connected(int dev)
+{
+    XBOX_INPUT_STATE state;
+
+    if (dev == 0)
+        return 1;
+    if (s_script_count[dev] < 0)
+        pad_script_parse(dev);
+    return s_script_count[dev] > 0
+        || xbox_InputGetState((DWORD)dev, &state) == 0;
+}
+
+int usb_gamepad_report(int dev, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
-    uint8_t synth = synthetic_buttons();
+    uint8_t synth = dev ? 0 : synthetic_buttons();
     int i;
 
     if (max < 20)
@@ -404,7 +437,7 @@ int usb_gamepad_report(uint8_t *out, int max)
         static int diag = -1;
         if (diag < 0)
             diag = getenv("RECOMP_INPUT_DIAG") != NULL;
-        if (diag) {
+        if (diag && dev == 0) {
             extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
             unsigned long now = (unsigned long)GetTickCount();
@@ -423,9 +456,9 @@ int usb_gamepad_report(uint8_t *out, int max)
         }
     }
 
-    if (xbox_InputGetState(0, &state) != 0) {
+    if (xbox_InputGetState((DWORD)dev, &state) != 0) {
         out[2] = synth;
-        pad_script(&out[2], &out[4]);
+        pad_script(dev, &out[2], &out[4]);
         return 20;
     }
 
@@ -442,16 +475,17 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
-    pad_script(&out[2], &out[4]);
+    pad_script(dev, &out[2], &out[4]);
     return 20;
 }
 
 /* ---- the output report ------------------------------------------------- */
 
-void usb_gamepad_output(const uint8_t *data, int len)
+void usb_gamepad_output(int dev, const uint8_t *data, int len)
 {
     static int trace = -1;
-    static uint16_t last_l = 0xFFFF, last_r = 0xFFFF;
+    static uint16_t last_l[USB_GAMEPADS] = { 0xFFFF, 0xFFFF };
+    static uint16_t last_r[USB_GAMEPADS] = { 0xFFFF, 0xFFFF };
     XBOX_VIBRATION vib;
 
     if (len < 6 || data[0] != 0x00 || data[1] < 6)
@@ -460,16 +494,16 @@ void usb_gamepad_output(const uint8_t *data, int len)
     vib.wRightMotorSpeed = (uint16_t)(data[4] | (data[5] << 8));
     /* The title resends the same speeds every frame or so; the host call
      * can be an IPC (Switch hid), so only changes go out. */
-    if (vib.wLeftMotorSpeed == last_l && vib.wRightMotorSpeed == last_r)
+    if (vib.wLeftMotorSpeed == last_l[dev] && vib.wRightMotorSpeed == last_r[dev])
         return;
-    last_l = vib.wLeftMotorSpeed;
-    last_r = vib.wRightMotorSpeed;
+    last_l[dev] = vib.wLeftMotorSpeed;
+    last_r[dev] = vib.wRightMotorSpeed;
     if (trace < 0)
         trace = getenv("RECOMP_RUMBLE_TRACE") != NULL;
     if (trace) {
-        fprintf(stderr, "  PAD: rumble %04X %04X\n",
+        fprintf(stderr, "  PAD%d: rumble %04X %04X\n", dev + 1,
                 vib.wLeftMotorSpeed, vib.wRightMotorSpeed);
         fflush(stderr);
     }
-    xbox_InputSetState(0, &vib);
+    xbox_InputSetState((DWORD)dev, &vib);
 }

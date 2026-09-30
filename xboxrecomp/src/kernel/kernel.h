@@ -659,6 +659,11 @@ NTSTATUS __stdcall xbox_NtReadFile(
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset);
 
+/* Called after every successful NtReadFile (POSIX/Switch) with the bytes read
+ * and the file offset they came from, so a port can patch game data as it
+ * loads. NULL (the default) = no hook. */
+extern void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
+
 NTSTATUS __stdcall xbox_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
