@@ -1038,7 +1038,8 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if lifter and lifter._is_external_target(target):
         # Conditional tail call: same frame bridge as the unconditional tail
         # jmp in _lift_jmp, applied only on the taken path.
-        if target in lifter.manual_functions:
+        if (target in lifter.manual_functions
+                and target not in lifter.wrapped_functions):
             return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; "
                     f"RECOMP_ITAIL(0x{target:08X}u); return; }}"
                     f" /* {jcc}: {desc}, manual tail */")
@@ -1288,6 +1289,11 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        # Wrapped functions: the project defines sub_X itself around the
+        # generated sub_X_gen. Their callers call sub_X directly -- it is a
+        # plain symbol -- instead of resolving it through the dispatch
+        # table on every call like a declare-only manual function.
+        self.wrapped_functions = set()
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1349,7 +1355,9 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        if addr in self.wrapped_functions:
+            name = f"sub_{addr:08X}"
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
@@ -2354,7 +2362,8 @@ class Lifter:
                     "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
                     f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
                     f" /* longjmp 0x{insn.call_target:08X} */")
-            elif insn.call_target in self.manual_functions:
+            elif (insn.call_target in self.manual_functions
+                    and insn.call_target not in self.wrapped_functions):
                 # A function the project replaces by hand. recomp_lookup_manual
                 # is consulted on indirect calls, and without this a direct
                 # caller went straight to the generated body and bypassed the
@@ -2553,7 +2562,8 @@ class Lifter:
             if self._is_external_target(insn.jump_target):
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
-                if insn.jump_target in self.manual_functions:
+                if (insn.jump_target in self.manual_functions
+                        and insn.jump_target not in self.wrapped_functions):
                     tail = (
                         f"g_seh_ebp = ebp; "
                         f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "

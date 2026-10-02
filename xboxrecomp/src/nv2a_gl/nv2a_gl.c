@@ -201,10 +201,17 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     GlSurf *s = surf_find(va), *victim = NULL;
     int i;
 
-    if (s && s->w == w && s->h == h) {
+    /* h is the surface clip, not the allocation: NFSU2's split screen clips
+     * the back buffer to 640x240 for each player's view and back to 640x480
+     * for the HUD, every frame. Rebuilding (and clearing) the surface on
+     * each change left only the HUD, over a black 3D world. Keep the
+     * surface while the clip fits; grow it when it does not. */
+    if (s && s->w == w && s->h >= h) {
         s->used = s_frame;
         return s;
     }
+    if (s && s->w == w && s->h > h)
+        h = s->h;
     if (!s) {
         for (i = 0; i < GL_MAX_SURF; i++) {
             if (!s_surf[i].fbo) { victim = &s_surf[i]; break; }
@@ -301,12 +308,12 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
 {
     uint32_t bpp = sf->bytes_per_pixel ? sf->bytes_per_pixel : 4;
     uint32_t w = sf->pitch ? sf->pitch / bpp : sf->width;
-    uint32_t h = sf->height;
+    uint32_t h = sf->clip_y + sf->height;   /* the clip need not start at 0 */
     GlSurf *s;
     GLuint ds;
     int fresh = 0;
 
-    if (w < sf->width) w = sf->width;
+    if (w < sf->clip_x + sf->width) w = sf->clip_x + sf->width;
     if (!w || !h || !sf->color_va)
         return NULL;
     s = surf_get(sf->color_va, w, h, sf->aa_sx ? sf->aa_sx : 1,
@@ -666,6 +673,19 @@ static GLint wrap_mode(uint32_t m)
     }
 }
 
+/* A surface kept taller than its clip (surf_get) and sampled as a texture
+ * of the clip's size: texcoords cover the w x h texels at the top left, not
+ * the whole surface. A texture of the surface's logical or real size keeps
+ * the old full-surface mapping (anti-aliased surfaces). */
+static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
+                     uint32_t aa_sx, uint32_t aa_sy, float scale[2])
+{
+    uint32_t lw = sw / (aa_sx ? aa_sx : 1), lh = sh / (aa_sy ? aa_sy : 1);
+
+    if (w < lw) scale[0] *= (float)w / (float)lw;
+    if (h < lh) scale[1] *= (float)h / (float)lh;
+}
+
 /* Bind stage `i` from the method shadow; returns the texcoord scale. */
 static void bind_stage(const uint32_t *regs, int i, float scale[2])
 {
@@ -706,6 +726,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
         tex = rt->tex;
         /* The image the title samples is the logical one; the FBO holds it
          * at the anti-aliased size. Normalised coordinates cover both. */
+        rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
     } else {
         tex = tex_get(va, color, w, h, pitch);
     }
@@ -1172,18 +1193,41 @@ typedef struct {
     uint32_t depth, dfunc, dmask;
     uint32_t stencil, smask, sfunc, sref, sread, sop[3];
     uint32_t cull, cullface, front, cm;
+    GLint    sc[4];                     /* scissor, stored pixels; sc[2] 0 = off */
 } GlState;
 static GlState s_st;
 static int s_st_valid;
 
 static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); }
 
-static void apply_state(const uint32_t *r, int has_depth)
+/* SET_SURFACE_CLIP as a scissor in s's stored pixels (sc[2] = 0: the clip
+ * covers the surface). NFSU2's split screen draws each player's world with
+ * the clip set to that player's half; the vertex programs place it there
+ * but do not stop at the edge, so without the scissor each view spilled
+ * over the other. xemu scissors the same way. */
+static void surface_scissor(const uint32_t *r, const GlSurf *s, GLint sc[4])
+{
+    uint32_t x0 = (r[0x200 / 4] & 0xFFFF) * s->aa_sx, x1 = x0 + (r[0x200 / 4] >> 16) * s->aa_sx;
+    uint32_t y0 = (r[0x204 / 4] & 0xFFFF) * s->aa_sy, y1 = y0 + (r[0x204 / 4] >> 16) * s->aa_sy;
+
+    sc[0] = sc[1] = sc[2] = sc[3] = 0;
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    if (x1 <= x0 || y1 <= y0 || (x0 == 0 && y0 == 0 && x1 == s->w && y1 == s->h))
+        return;
+    sc[0] = to_stored(x0, s->pw, s->w);
+    sc[1] = to_stored(y0, s->ph, s->h);
+    sc[2] = to_stored(x1, s->pw, s->w) - sc[0];
+    sc[3] = to_stored(y1, s->ph, s->h) - sc[1];
+}
+
+static void apply_state(const uint32_t *r, int has_depth, const GlSurf *s)
 {
     uint32_t cm = r[0x358 / 4];
     GlState want;
 
     memset(&want, 0, sizeof want);
+    surface_scissor(r, s, want.sc);
     if (r[0x304 / 4]) {
         want.blend = 1; want.bsrc = r[0x344 / 4]; want.bdst = r[0x348 / 4];
         want.beq = r[0x350 / 4]; want.bcolor = r[0x34C / 4];
@@ -1244,7 +1288,12 @@ static void apply_state(const uint32_t *r, int has_depth)
     }
     glColorMask((cm & 0x00010000u) != 0, (cm & 0x00000100u) != 0,
                 (cm & 0x00000001u) != 0, (cm & 0x01000000u) != 0);
-    glDisable(GL_SCISSOR_TEST);
+    if (want.sc[2] > 0) {               /* rows are top-first, as in clears */
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(want.sc[0], want.sc[1], want.sc[2], want.sc[3]);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
     /* The NV2A does not clip against the near and far planes; it clamps
      * depth. GL clips there, so a screen quad placed at the far plane
      * (NFSU2's loading screen, z = 1.0 through its vertex program) vanished
@@ -1764,7 +1813,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         }
     }
 
-    apply_state(r, b->zeta_va != 0);
+    apply_state(r, b->zeta_va != 0, s);
 
     glBindVertexArray(s_vao);
     if (!upload_vertices(b))
@@ -1987,7 +2036,11 @@ static void gl_flip(void)
             clock_gettime(CLOCK_MONOTONIC, &now);
             dt = (double)(now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
             if (dt >= 10.0) {
-                fprintf(stderr, "[fps] %.1f fps (frame %u)\n", (s_frame - last_frame) / dt, s_frame);
+                extern void xbox_vblank_report(double, char *, size_t);
+                char vb[128];
+                xbox_vblank_report(dt, vb, sizeof vb);
+                fprintf(stderr, "[fps] %.1f fps (frame %u), %s\n",
+                        (s_frame - last_frame) / dt, s_frame, vb);
                 last_frame = s_frame;
                 last = now;
             }

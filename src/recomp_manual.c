@@ -562,6 +562,995 @@ extern void sub_002618F0_gen(void);
 void sub_002618F0(void) { sub_002618F0_gen(); }
 #endif
 
+/* ── 4x4 matrix multiply, sub_002213EA ─────────────────────────
+ *
+ * stdcall (out, a, b), ret 12, eax = out: out = a * b, row-major floats, in
+ * SSE (shufps a[i][j] across the row, mulps by row j of b, addps). Every
+ * xmm register of the lifted body is thread-local, so each call was ~100
+ * TLS accesses (calls on Horizon). sub_000A2EA0 calls it twice per object
+ * drawn; at a drag start line (Coastal Express, ~2300 draws a frame) it was
+ * 15-18% of the main thread on x86, native -22% main-thread time per frame.
+ * Same sums in the same order, ((p0 + p1) + p2) + p3, no FMA contraction;
+ * all rows are computed before the store, as out may alias a or b.
+ * RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1 both and compare (Linux race:
+ * 0 mismatches in 4.4M calls). */
+extern void sub_002213EA_gen(void);
+
+__attribute__((optimize("fp-contract=off")))
+static void mat4_mul(float *o, const float *a, const float *b)
+{
+    float r[16];
+    int i, k;
+    for (i = 0; i < 4; i++)
+        for (k = 0; k < 4; k++) {
+            float s = a[4 * i] * b[k];
+            s = s + a[4 * i + 1] * b[4 + k];
+            s = s + a[4 * i + 2] * b[8 + k];
+            s = s + a[4 * i + 3] * b[12 + k];
+            r[4 * i + k] = s;
+        }
+    memcpy(o, r, sizeof r);
+}
+
+void sub_002213EA(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    uint32_t out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    if (mode == 0) {
+        sub_002213EA_gen();
+        return;
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        float o[16], ma[16], mb[16];
+        memcpy(ma, (const void *)XBOX_PTR(a), 64);
+        memcpy(mb, (const void *)XBOX_PTR(b), 64);
+        mat4_mul(o, ma, mb);
+        sub_002213EA_gen();             /* pops its own arguments */
+        calls++;
+        if (memcmp(o, (const void *)XBOX_PTR(out), 64) && bad++ < 20)
+            fprintf(stderr, "[native] sub_002213EA mismatch: out %08X a %08X b %08X\n",
+                    out, a, b);
+        if ((calls & 0xFFFFF) == 0)
+            fprintf(stderr, "[native] sub_002213EA: %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    mat4_mul((float *)XBOX_PTR(out), (const float *)XBOX_PTR(a), (const float *)XBOX_PTR(b));
+    eax = out;
+    esp += 16;                          /* return address + three arguments */
+}
+
+/* ── Float to integer, sub_002A68EC (_ftol2) ──────────────────
+ *
+ * MSVC's CRT _ftol2: st(0) truncated to a 64-bit integer in edx:eax, popped.
+ * Every (int)float cast in the title calls it (589 sites); the hottest
+ * function of the main thread in a Linux race (4.4%). It rounds with fistp
+ * (the control word's mode), then corrects towards zero by the sign of the
+ * float (x - r): x >= 0 and x - r < 0 -> r - 1; x < 0 (sign of (float)x)
+ * and x - r > 0 -> r + 1. r == 0 or the integer indefinite is returned as
+ * is. Exact, including ecx, the frame it publishes and the x87 top.
+ * RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1 both and compare. */
+extern void sub_002A68EC_gen(void);
+
+__attribute__((noinline, cold)) static int64_t ftol_fist_slow(double x, uint16_t cw)
+{
+    return recomp_fist(x, cw, 64);
+}
+
+static inline int64_t ftol_fist(double x, uint16_t cw)
+{
+    if (__builtin_expect(((cw >> 10) & 3u) == 0 && fabs(x) < 0x1p63, 1))
+        return (int64_t)rint(x);        /* host rounding is never changed: nearest */
+    return ftol_fist_slow(x, cw);       /* other modes, NaN, out of range */
+}
+
+static inline void ftol2_native(double x, uint32_t *peax, uint32_t *pedx, uint32_t *pecx)
+{
+    int64_t r = ftol_fist(x, g_fp_control_word);
+    uint32_t lo = (uint32_t)r, hi = (uint32_t)((uint64_t)r >> 32), d;
+    float fx = (float)x, fd;
+    uint32_t sx;
+
+    if (lo == 0 && (hi & 0x7FFFFFFFu) == 0) {   /* 0 or the indefinite */
+        *peax = lo;
+        *pedx = hi;
+        return;
+    }
+    fd = (float)(x - (double)r);
+    memcpy(&d, &fd, 4);
+    memcpy(&sx, &fx, 4);
+    if (sx & 0x80000000u) {
+        d ^= 0x80000000u;
+        r += d >= 0x80000001u;          /* carry of d + 0x7FFFFFFF */
+    } else {
+        r -= d >= 0x80000001u;          /* borrow */
+    }
+    *peax = (uint32_t)r;
+    *pedx = (uint32_t)((uint64_t)r >> 32);
+    *pecx = d + 0x7FFFFFFFu;
+}
+
+/* Modes other than plain native, out of line so that the hot path below is
+ * small enough for LTO to inline into its 581 lifted callers. */
+static int s_ftol_mode = -1;            /* 0 lifted, 1 native, 2 native + check */
+
+__attribute__((noinline, cold)) static void ftol2_slow(void)
+{
+    double x = g_fp_stack[g_fp_top & 7];
+    uint32_t a, d, c = ecx, frame = esp - 4u;
+
+    if (s_ftol_mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *k = getenv("RECOMP_NATIVE_CHECK");
+        s_ftol_mode = (e && *e == '0') ? 0 : (k && *k == '1') ? 2 : 1;
+    }
+    if (s_ftol_mode == 0) {
+        sub_002A68EC_gen();
+        return;
+    }
+    ftol2_native(x, &a, &d, &c);
+    if (s_ftol_mode == 2) {
+        static unsigned long calls, bad;
+        int top = (g_fp_top + 1) & 7;
+        uint32_t sp = esp + 4u;
+        sub_002A68EC_gen();
+        calls++;
+        if ((eax != a || edx != d || ecx != c || g_fp_top != top || esp != sp
+             || g_ebp != frame) && bad++ < 20)
+            fprintf(stderr, "[native] sub_002A68EC mismatch for %.17g: lifted %08X:%08X "
+                    "ecx %08X, native %08X:%08X ecx %08X\n", x, edx, eax, ecx, d, a, c);
+        if ((calls & 0xFFFFFF) == 0)
+            fprintf(stderr, "[native] sub_002A68EC: %lu calls, %lu mismatches\n", calls, bad);
+        return;
+    }
+    eax = a;
+    edx = d;
+    ecx = c;
+    g_fp_top = (g_fp_top + 1) & 7;
+    g_ebp = g_seh_ebp = frame;
+    esp += 4;
+}
+
+inline void sub_002A68EC(void)
+{
+    uint32_t a, d, c, frame;
+    int top;
+
+    if (__builtin_expect(s_ftol_mode != 1, 0)) {
+        ftol2_slow();                   /* first call, lifted or check mode */
+        return;
+    }
+    top = g_fp_top;
+    c = ecx;
+    frame = esp - 4u;
+    ftol2_native(g_fp_stack[top & 7], &a, &d, &c);
+    eax = a;
+    edx = d;
+    ecx = c;
+    g_fp_top = (top + 1) & 7;
+    g_ebp = g_seh_ebp = frame;          /* as its push ebp / mov ebp, esp left them */
+    esp += 4;                           /* return address */
+}
+
+/* ── Small math leaves of the main thread ─────────────────────
+ *
+ * Each about 0.3-0.8% of the main thread in a Linux race, more on the
+ * console, where every x87 slot and register the lifted bodies touch is
+ * thread-local. Exact as the lifted code computes them (x87 values as
+ * doubles, rounded to float where the original stores), including the
+ * registers, flags and frame they leave behind. RECOMP_NATIVE=0 lifted,
+ * RECOMP_NATIVE_CHECK=1 both and compare. */
+static int native_mode(void)
+{
+    const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+    return (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+}
+
+static void native_report(const char *name, unsigned long *calls, unsigned long *bad, int ok,
+                          uint32_t a0, uint32_t a1, uint32_t a2)
+{
+    ++*calls;
+    if (!ok && (*bad)++ < 20)
+        fprintf(stderr, "[native] %s mismatch: args %08X %08X %08X\n", name, a0, a1, a2);
+    if ((*calls & 0xFFFFF) == 0 || *calls == 4096)
+        fprintf(stderr, "[native] %s: %lu calls, %lu mismatches\n", name, *calls, *bad);
+}
+
+/* sub_0004BC20: cdecl (out, m, v) -- out = v * m, m a row-major 4x4 with
+ * the translation in row 3; all three sums before the stores. */
+extern void sub_0004BC20_gen(void);
+
+static void xform_point(uint32_t m, uint32_t v, float o[3])
+{
+    double v0 = MEMF(v), v1 = MEMF(v + 4), v2 = MEMF(v + 8);
+    o[0] = (float)(((MEMF(m + 0x20) * v2 + MEMF(m + 0x10) * v1) + MEMF(m + 0x00) * v0)
+                   + MEMF(m + 0x30));
+    o[1] = (float)(((MEMF(m + 0x24) * v2 + MEMF(m + 0x04) * v0) + MEMF(m + 0x14) * v1)
+                   + MEMF(m + 0x34));
+    o[2] = (float)(((MEMF(m + 0x28) * v2 + MEMF(m + 0x08) * v0) + MEMF(m + 0x18) * v1)
+                   + MEMF(m + 0x38));
+}
+
+void sub_0004BC20(void)
+{
+    static int mode = -1;
+    uint32_t out = MEM32(esp + 4), m = MEM32(esp + 8), v = MEM32(esp + 12), e0 = esp;
+    float o[3];
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_0004BC20_gen();
+        return;
+    }
+    xform_point(m, v, o);
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        uint32_t sv_edx = edx;
+        int top = g_fp_top;
+        sub_0004BC20_gen();
+        native_report("sub_0004BC20", &calls, &bad,
+                      !memcmp(o, (const void *)XBOX_PTR(out), 12) && eax == out && ecx == v
+                      && edx == sv_edx && g_fp_top == top && esp == e0 + 4u
+                      && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u, out, m, v);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), o, 12);
+    eax = out;
+    ecx = v;
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 4;
+}
+
+/* sub_0004B260: cdecl (uint16 angle) -> st(0): a = angle * C, reduced to
+ * x in range with a sign s, then s * (x - x^3 D1 + x^5 D2 - x^7 D3 + x^9 D4)
+ * (a sine). Also writes the zero-extended angle back to its argument slot
+ * and leaves fnstsw's word of the last compare in ax. */
+extern void sub_0004B260_gen(void);
+
+static double sine16(uint32_t angle, uint32_t *peax, int top0)
+{
+    const double a = (double)(int32_t)angle * MEMF(0x0034089Cu);
+    double s = MEMF(0x003408ACu), x = a;
+    int cmp = RECOMP_FCMP(a, (double)MEMF(0x00343644u));
+    uint16_t cc = RECOMP_FCMP_CC(cmp);
+
+    if (!(cc & 0x0100u)) {
+        x = a - MEMF(0x00340AFCu);
+    } else {
+        cmp = RECOMP_FCMP(a, (double)MEMF(0x003408B0u));
+        cc = RECOMP_FCMP_CC(cmp);
+        if (!(cc & 0x0100u)) {
+            x = a - MEMF(0x00343640u);
+            s = MEMF(0x003408FCu);
+        }
+    }
+    g_fp_cmp = cmp;
+    g_fp_cc = cc;
+    *peax = (uint32_t)(uint16_t)((((top0 + 6) & 7u) << 11) | cc);
+    double x2 = x * x, x3 = x2 * x, x5 = x3 * x2, x7 = x5 * x2, x9 = x7 * x2;
+    double acc = x - x3 * MEMF(0x0034363Cu);
+    acc = acc + x5 * MEMF(0x00343638u);
+    acc = acc - x7 * MEMF(0x00343634u);
+    acc = acc + x9 * MEMF(0x00343630u);
+    return acc * s;
+}
+
+void sub_0004B260(void)
+{
+    static int mode = -1;
+    uint32_t angle = MEM16(esp + 4), e0 = esp, a;
+    int top0 = g_fp_top;
+    double r;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_0004B260_gen();
+        return;
+    }
+    r = sine16(angle, &a, top0);
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        int cmp = g_fp_cmp;
+        uint16_t cc = g_fp_cc;
+        sub_0004B260_gen();
+        native_report("sub_0004B260", &calls, &bad,
+                      !memcmp(&r, &g_fp_stack[g_fp_top & 7], 8) && g_fp_top == ((top0 + 7) & 7)
+                      && eax == a && g_fp_cmp == cmp && g_fp_cc == cc && esp == e0 + 4u
+                      && MEM32(e0 + 4u) == angle && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u,
+                      angle, 0, 0);
+        return;
+    }
+    MEM32(e0 + 4u) = angle;
+    g_fp_top = (top0 + 7) & 7;
+    g_fp_stack[g_fp_top] = r;
+    eax = a;
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 4;
+}
+
+/* sub_001C6900: cdecl (obj, const float p[3], float r) -> int. d = p - c
+ * (c at obj+0x60); if d.n (n at obj+0x70) < -r: 0. Otherwise L = |d| - r
+ * (as a float) and v = L > r ? A / L * r : A (A at obj+0x80), truncated
+ * (cvttss2si, lifted as a cast). Frame aligned to 16; xmm0 is left as its
+ * movups of the frame (v, L, caller's frame, return address). */
+extern void sub_001C6900_gen(void);
+
+static int32_t sphere_fade(uint32_t obj, uint32_t p, float r, int *pcmp, uint16_t *pcc,
+                           float *pv, float *pl)
+{
+    double dx = (double)MEMF(p) - MEMF(obj + 0x60);
+    double dy = (double)MEMF(p + 4) - MEMF(obj + 0x64);
+    double dz = (double)MEMF(p + 8) - MEMF(obj + 0x68);
+    double dot = (dy * MEMF(obj + 0x74) + dz * MEMF(obj + 0x78)) + dx * MEMF(obj + 0x70);
+    double nr = -(double)r;
+    float l, v;
+
+    *pcmp = RECOMP_FCMP(nr, dot);
+    *pcc = RECOMP_FCMP_CC(*pcmp);
+    if (!(*pcc & 0x4100u))
+        return -1;                      /* outside: returns 0, xmm0 untouched */
+    l = (float)(sqrt((dx * dx + dy * dy) + dz * dz) - r);
+    *pcmp = RECOMP_FCMP((double)l, (double)r);
+    *pcc = RECOMP_FCMP_CC(*pcmp);
+    v = (*pcc & 0x4100u) ? MEMF(obj + 0x80)
+                         : (float)((double)MEMF(obj + 0x80) / l * r);
+    *pv = v;
+    *pl = l;
+    return 0;
+}
+
+void sub_001C6900(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, obj = MEM32(esp + 4), p = MEM32(esp + 8), rv = MEM32(esp + 12);
+    uint32_t frame = (e0 - 12u) & ~15u, res, sv_edx = edx;
+    uint32_t caller_ebp = g_seh_ebp, ret = MEM32(e0);
+    float r, v = 0, l = 0;
+    int cmp, top = g_fp_top;
+    uint16_t cc;
+    RecompXmm x0;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_001C6900_gen();
+        return;
+    }
+    memcpy(&r, &rv, 4);
+    x0 = g_xmm0;
+    if (sphere_fade(obj, p, r, &cmp, &cc, &v, &l) == 0) {
+        res = (uint32_t)(int32_t)v;
+        x0.f[0] = v;
+        x0.f[1] = l;
+        x0.u[2] = caller_ebp;
+        x0.u[3] = ret;
+    } else {
+        res = 0;
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        sub_001C6900_gen();
+        native_report("sub_001C6900", &calls, &bad,
+                      eax == res && ecx == obj && edx == sv_edx && g_fp_top == top
+                      && g_fp_cmp == cmp && g_fp_cc == cc && !memcmp(&x0, &g_xmm0, 16)
+                      && esp == e0 + 4u && g_ebp == frame && g_seh_ebp == frame, obj, p, rv);
+        return;
+    }
+    eax = res;
+    ecx = obj;
+    g_fp_cmp = cmp;
+    g_fp_cc = cc;
+    g_xmm0 = x0;
+    g_ebp = g_seh_ebp = frame;
+    esp += 4;
+}
+
+/* sub_000113A0: cdecl (dst, src) -- a 4x4 float matrix copied row by row
+ * (each row read before it is written; the middle two of each row through
+ * the x87, as doubles). Its argument slot src ends as src[15]'s bits. */
+extern void sub_000113A0_gen(void);
+
+void sub_000113A0(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, dst = MEM32(esp + 4), src = MEM32(esp + 8), r;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_000113A0_gen();
+        return;
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        uint32_t want[16];
+        for (r = 0; r < 16; r++) {
+            volatile double f = MEMF(src + 4u * r);
+            float g = (float)f;
+            if ((r & 3) == 1 || (r & 3) == 2)
+                memcpy(&want[r], &g, 4);
+            else
+                want[r] = MEM32(src + 4u * r);
+        }
+        sub_000113A0_gen();
+        native_report("sub_000113A0", &calls, &bad,
+                      !memcmp(want, (const void *)XBOX_PTR(dst), 64) && eax == dst
+                      && ecx == want[12] && edx == want[15] && MEM32(e0 + 8u) == want[15]
+                      && esp == e0 + 4u && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u,
+                      dst, src, 0);
+        return;
+    }
+    for (r = 0; r < 64; r += 16) {
+        uint32_t w0 = MEM32(src + r), w3 = MEM32(src + r + 12);
+        volatile double f1 = MEMF(src + r + 4), f2 = MEMF(src + r + 8);
+        MEMF(dst + r + 4) = (float)f1;
+        MEM32(dst + r) = w0;
+        MEMF(dst + r + 8) = (float)f2;
+        MEM32(dst + r + 12) = w3;
+    }
+    MEM32(e0 + 8u) = MEM32(src + 0x3C);
+    eax = dst;
+    ecx = MEM32(src + 0x30);
+    edx = MEM32(src + 0x3C);
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 4;
+}
+
+/* x87 compare as the lifted code records it; with sw, also fnstsw ax. */
+static inline uint16_t fcmp_rec(double a, double b, int top, int sw)
+{
+    g_fp_cmp = RECOMP_FCMP(a, b);
+    g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);
+    if (sw)
+        eax = (eax & 0xFFFF0000u) | (uint16_t)(((top & 7u) << 11) | g_fp_cc);
+    return g_fp_cc;
+}
+
+/* sub_001C3430: thiscall (poly, const float p[2]) -> st(0), ret 4. Edge
+ * functions e = (b.y - a.y)(p.x - a.x) - (p.y - a.y)(b.x - a.x) over the
+ * corners at +0x30/+0x40/+0x50/+0x60 (a fourth edge when [poly+9] == 4);
+ * returns their maximum, starting from K (0x3408FC) unless e1 is past it,
+ * as soon as it is above Z (0x33FA8C). Each e goes through the argument
+ * slot as a float. */
+extern void sub_001C3430_gen(void);
+
+static inline double poly_edge(uint32_t o, uint32_t p, uint32_t a, uint32_t b)
+{
+    return (float)((((double)MEMF(o + b + 4) - MEMF(o + a + 4))
+                    * ((double)MEMF(p) - MEMF(o + a)))
+                   - (((double)MEMF(p + 4) - MEMF(o + a + 4))
+                      * ((double)MEMF(o + b) - MEMF(o + a))));
+}
+
+static double poly_max_edge(uint32_t o, uint32_t p, uint32_t slot, int t1)
+{
+    static const uint8_t edges[3][2] = { { 0x40, 0x50 }, { 0x60, 0x30 }, { 0x50, 0x60 } };
+    const double k = MEMF(0x003408FCu), z = MEMF(0x0033FA8Cu);
+    float e = (float)poly_edge(o, p, 0x30, 0x40);
+    double m;
+    int i;
+
+    MEMF(slot) = e;
+    if (!(fcmp_rec(k, e, t1, 1) & 0x4100u)) {
+        m = k;
+    } else {
+        if (!(fcmp_rec(e, z, t1, 1) & 0x4100u))
+            return e;
+        m = e;
+    }
+    for (i = 0; i < 3; i++) {
+        if (i == 2 && MEM8(o + 9) != 4)
+            return m;
+        e = (float)poly_edge(o, p, edges[i][0], edges[i][1]);
+        MEMF(slot) = e;
+        if (fcmp_rec(m, e, t1, 1) & 0x4100u)
+            m = e;
+        if (!(fcmp_rec(m, z, t1, i < 2) & 0x4100u) || i == 2)
+            return m;
+    }
+    return m;
+}
+
+void sub_001C3430(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, o = ecx, p = MEM32(esp + 4);
+    int top0 = g_fp_top, t1 = (top0 + 7) & 7;
+    double r;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_001C3430_gen();
+        return;
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        uint32_t a0 = eax, a, sl;
+        int cmp;
+        uint16_t cc;
+        r = poly_max_edge(o, p, e0 + 4u, t1);
+        a = eax; cmp = g_fp_cmp; cc = g_fp_cc; sl = MEM32(e0 + 4u);
+        eax = a0;
+        MEM32(e0 + 4u) = p;
+        sub_001C3430_gen();
+        native_report("sub_001C3430", &calls, &bad,
+                      !memcmp(&r, &g_fp_stack[t1], 8) && g_fp_top == t1 && eax == a
+                      && g_fp_cmp == cmp && g_fp_cc == cc && MEM32(e0 + 4u) == sl
+                      && ecx == o && edx == p && esp == e0 + 8u
+                      && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u, o, p, 0);
+        return;
+    }
+    r = poly_max_edge(o, p, e0 + 4u, t1);
+    g_fp_top = t1;
+    g_fp_stack[t1] = r;
+    edx = p;
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 8;                           /* return address + one argument */
+}
+
+/* sub_0004C6E0: cdecl (const float p[2], const float s[2], const float q[2],
+ * float m) -> 1 when q lies within [p - m, p + s + m] on both axes. */
+extern void sub_0004C6E0_gen(void);
+
+void sub_0004C6E0(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, p = MEM32(esp + 4), s = MEM32(esp + 8), q = MEM32(esp + 12);
+    uint32_t sv_eax = eax, sv_edx = edx, res = 0, a, d = edx;
+    double m = MEMF(esp + 16);
+    int top = g_fp_top, k, cmp;
+    uint16_t cc;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_0004C6E0_gen();
+        return;
+    }
+    for (k = 0; k < 2; k++) {
+        if (!(fcmp_rec((double)MEMF(p + 4u * k) - m, MEMF(q + 4u * k), top, 1) & 0x4100u))
+            break;
+        d = s;
+        if ((fcmp_rec(m + MEMF(s + 4u * k), MEMF(q + 4u * k), top, 1) & 0x4500u) == 0x0100u)
+            break;
+    }
+    res = k == 2;
+    a = res; cmp = g_fp_cmp; cc = g_fp_cc;
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        eax = sv_eax;
+        edx = sv_edx;
+        sub_0004C6E0_gen();
+        native_report("sub_0004C6E0", &calls, &bad,
+                      eax == a && ecx == q && edx == d && g_fp_cmp == cmp && g_fp_cc == cc
+                      && g_fp_top == top && esp == e0 + 4u
+                      && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u, p, s, q);
+        return;
+    }
+    eax = res;
+    ecx = q;
+    edx = d;
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 4;
+}
+
+/* sub_001C65D0: thiscall (obj, float out[12]), ret 4: three rows of int16
+ * (obj+0x2C..0x3C) times S (0x35D678) as floats, each row padded with a
+ * zero dword. Its argument slot ends as the last int16 read. */
+extern void sub_001C65D0_gen(void);
+
+void sub_001C65D0(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, o = ecx, out = MEM32(esp + 4), r;
+    const double sc = MEMF(0x0035D678u);
+    float v[12];
+    int top = g_fp_top;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_001C65D0_gen();
+        return;
+    }
+    for (r = 0; r < 3; r++) {
+        uint32_t b = o + 0x2Cu + 6u * r;
+        v[4 * r]     = (float)((double)(int16_t)MEM16(b) * sc);
+        v[4 * r + 1] = (float)((double)(int16_t)MEM16(b + 2) * sc);
+        v[4 * r + 2] = (float)((double)(int16_t)MEM16(b + 4) * sc);
+        memset(&v[4 * r + 3], 0, 4);
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        uint32_t sv_esi = esi;
+        sub_001C65D0_gen();
+        native_report("sub_001C65D0", &calls, &bad,
+                      !memcmp(v, (const void *)XBOX_PTR(out), 48) && eax == out
+                      && ecx == (uint32_t)(int32_t)(int16_t)MEM16(o + 0x38) && edx == 0
+                      && esi == sv_esi && MEM32(e0 + 4u) == ecx && g_fp_top == top
+                      && esp == e0 + 8u && g_ebp == e0 - 4u && g_seh_ebp == e0 - 4u,
+                      o, out, 0);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), v, 48);
+    eax = out;
+    ecx = (uint32_t)(int32_t)(int16_t)MEM16(o + 0x38);
+    edx = 0;
+    MEM32(e0 + 4u) = ecx;
+    g_ebp = g_seh_ebp = e0 - 4u;
+    esp += 8;
+}
+
+/* sub_002EEA80: D3D's SSE 4x4 multiply, stdcall (out, a, b), ret 12 --
+ * the same sums as sub_002213EA (mat4_mul). Leaves the result rows in
+ * xmm2..xmm5 and a[3][2] * b row 2 / a[3][3] * b row 3 in xmm0 / xmm1;
+ * eax = a, ecx = out. */
+extern void sub_002EEA80_gen(void);
+
+__attribute__((optimize("fp-contract=off")))
+static void d3d_mat_mul(uint32_t out, uint32_t a, uint32_t b, RecompXmm x[6])
+{
+    float ma[16], mb[16], o[16];
+    int k;
+    memcpy(ma, (const void *)XBOX_PTR(a), 64);
+    memcpy(mb, (const void *)XBOX_PTR(b), 64);
+    mat4_mul(o, ma, mb);
+    for (k = 0; k < 4; k++) {
+        x[0].f[k] = ma[14] * mb[8 + k];
+        x[1].f[k] = ma[15] * mb[12 + k];
+    }
+    memcpy(&x[2], o, 64);
+}
+
+void sub_002EEA80(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
+    RecompXmm x[6];
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_002EEA80_gen();
+        return;
+    }
+    d3d_mat_mul(out, a, b, x);
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        sub_002EEA80_gen();
+        native_report("sub_002EEA80", &calls, &bad,
+                      !memcmp(&x[2], (const void *)XBOX_PTR(out), 64) && eax == a && ecx == out
+                      && !memcmp(&x[0], &g_xmm0, 16) && !memcmp(&x[1], &g_xmm1, 16)
+                      && !memcmp(&x[2], &g_xmm2, 16) && !memcmp(&x[3], &g_xmm3, 16)
+                      && !memcmp(&x[4], &g_xmm4, 16) && !memcmp(&x[5], &g_xmm5, 16)
+                      && esp == e0 + 16u, out, a, b);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), &x[2], 64);
+    g_xmm0 = x[0]; g_xmm1 = x[1]; g_xmm2 = x[2];
+    g_xmm3 = x[3]; g_xmm4 = x[4]; g_xmm5 = x[5];
+    eax = a;
+    ecx = out;
+    esp += 16;                          /* return address + three arguments */
+}
+
+/* sub_0004B940: cdecl (out, a, b): t = b * a (row-major), each element
+ * summed in its own order (as the compiler scheduled it), then copied to
+ * out by sub_000113A0 -- whose frame, ecx and edx it leaves behind. */
+extern void sub_0004B940_gen(void);
+
+static void mat_mul_ba(const float *A, const float *B, float *t)
+{
+    t[0] = (float)((((double)A[0] * B[0] + (double)B[3] * A[12]) + (double)B[2] * A[8]) + (double)B[1] * A[4]);
+    t[1] = (float)((((double)A[13] * B[3] + (double)A[1] * B[0]) + (double)B[1] * A[5]) + (double)A[9] * B[2]);
+    t[2] = (float)((((double)A[10] * B[2] + (double)A[6] * B[1]) + (double)A[2] * B[0]) + (double)B[3] * A[14]);
+    t[3] = (float)((((double)A[7] * B[1] + (double)A[15] * B[3]) + (double)B[2] * A[11]) + (double)B[0] * A[3]);
+    t[4] = (float)((((double)B[6] * A[8] + (double)A[4] * B[5]) + (double)B[7] * A[12]) + (double)B[4] * A[0]);
+    t[5] = (float)((((double)B[6] * A[9] + (double)B[4] * A[1]) + (double)B[5] * A[5]) + (double)B[7] * A[13]);
+    t[6] = (float)((((double)B[7] * A[14] + (double)B[6] * A[10]) + (double)A[6] * B[5]) + (double)B[4] * A[2]);
+    t[7] = (float)((((double)A[15] * B[7] + (double)B[6] * A[11]) + (double)B[4] * A[3]) + (double)A[7] * B[5]);
+    t[8] = (float)((((double)B[10] * A[8] + (double)B[9] * A[4]) + (double)B[11] * A[12]) + (double)B[8] * A[0]);
+    t[9] = (float)((((double)B[10] * A[9] + (double)B[8] * A[1]) + (double)B[9] * A[5]) + (double)B[11] * A[13]);
+    t[10] = (float)((((double)B[11] * A[14] + (double)B[10] * A[10]) + (double)A[6] * B[9]) + (double)B[8] * A[2]);
+    t[11] = (float)((((double)A[15] * B[11] + (double)B[10] * A[11]) + (double)B[8] * A[3]) + (double)A[7] * B[9]);
+    t[12] = (float)((((double)B[14] * A[8] + (double)B[13] * A[4]) + (double)B[15] * A[12]) + (double)B[12] * A[0]);
+    t[13] = (float)((((double)B[14] * A[9] + (double)B[12] * A[1]) + (double)B[13] * A[5]) + (double)B[15] * A[13]);
+    t[14] = (float)((((double)B[15] * A[14] + (double)B[14] * A[10]) + (double)A[6] * B[13]) + (double)B[12] * A[2]);
+    t[15] = (float)((((double)A[15] * B[15] + (double)B[14] * A[11]) + (double)B[12] * A[3]) + (double)A[7] * B[13]);
+}
+
+void sub_0004B940(void)
+{
+    static int mode = -1;
+    uint32_t e0 = esp, out = MEM32(esp + 4), a = MEM32(esp + 8), b = MEM32(esp + 12);
+    uint32_t frame = ((e0 - 12u) & ~15u) - 0x50u, w12, w15;
+    float A[16], B[16], t[16];
+    int top = g_fp_top;
+
+    if (mode < 0)
+        mode = native_mode();
+    if (mode == 0) {
+        sub_0004B940_gen();
+        return;
+    }
+    memcpy(A, (const void *)XBOX_PTR(a), 64);
+    memcpy(B, (const void *)XBOX_PTR(b), 64);
+    mat_mul_ba(A, B, t);
+    memcpy(&w12, &t[12], 4);
+    memcpy(&w15, &t[15], 4);
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        sub_0004B940_gen();
+        native_report("sub_0004B940", &calls, &bad,
+                      !memcmp(t, (const void *)XBOX_PTR(out), 64) && eax == out && ecx == w12
+                      && edx == w15 && g_fp_top == top && esp == e0 + 4u
+                      && g_ebp == frame && g_seh_ebp == frame, out, a, b);
+        return;
+    }
+    memcpy((void *)XBOX_PTR(out), t, 64);
+    eax = out;
+    ecx = w12;
+    edx = w15;
+    g_ebp = g_seh_ebp = frame;
+    esp += 4;
+}
+
+/* ── Colour grade table, sub_000A3CA0 ─────────────────────────
+ *
+ * cdecl (k): rebuilds grade table k (0/1) -- N x N A8R8G8B8 texels, N =
+ * [0x39D324], swizzled (masks as sub_00098D70 makes them for N x N x 0),
+ * at [0x3E8C18] + 4 * N * N * k -- from its four curve parameters at
+ * 0x39D304 + 16k (P0..P3), and caches them at 0x3E8BF0 + 16k. Its callers
+ * (sub_000A3FA0) rebuild whenever a parameter changed, which in races is
+ * every frame: 2% of the main thread on x86, each texel four divisions and
+ * four _ftol2 calls. Texel (i, j): channels from x = i/N (A from P3, B from
+ * P1, as floats), y = j/N (R from P0 as a float, the last byte from P2
+ * unrounded -- it never leaves the x87 stack), each through
+ *   t = (K1 - 2v) * (K1 / P - K3)   (stored as a float)
+ *   v < K2 ? v / (t + K1) : (t - v) / (t - K1)   (NaN: the second)
+ * times K4, truncated. Exact, as the lifted code computes it (doubles,
+ * float rounding where it stores). RECOMP_NATIVE=0 lifted,
+ * RECOMP_NATIVE_CHECK=1 both and compare. */
+extern void sub_000A3CA0_gen(void);
+
+static inline double grade_curve(double v, double p, double k1, double k2, double k3)
+{
+    double t = (float)((k1 - (v + v)) * (k1 / p - k3));
+    return v < k2 ? v / (t + k1) : (t - v) / (t - k1);
+}
+
+static inline uint32_t grade_byte(double v)
+{
+    uint32_t a, d, c = 0;
+    ftol2_native(v, &a, &d, &c);
+    return a & 0xFFu;
+}
+
+/* Fills out[] (N * N texels at their swizzled offsets) for table k. */
+static void grade_table(uint32_t *out, uint32_t k, int32_t n)
+{
+    const double k1 = MEMF(0x003408ACu), k2 = MEMF(0x003408BCu);
+    const double k3 = MEMF(0x00343F00u), k4 = MEMF(0x00343658u);
+    const uint32_t pb = 0x0039D304u + 16u * k;
+    const double p0 = MEMF(pb), p1 = MEMF(pb + 4), p2 = MEMF(pb + 8), p3 = MEMF(pb + 12);
+    const double nf = (float)n;
+    uint32_t mu = 0, mv = 0, bit = 1, lvl, us = 0, vs, base = (uint32_t)(n * n) * k;
+    int32_t i, j;
+
+    for (lvl = 1;; lvl <<= 1) {         /* sub_00098D70(n, n, 0) */
+        int any = 0;
+        if (lvl < (uint32_t)n) { mu |= bit; bit <<= 1; any = 1; }
+        if (lvl < (uint32_t)n) { mv |= bit; bit <<= 1; any = 1; }
+        if (!any)
+            break;
+    }
+    for (i = 0; i < n; i++, us = (us - mu) & mu) {
+        double x = (double)i / (double)n;
+        uint32_t ca = grade_byte((double)(float)grade_curve((float)x, p3, k1, k2, k3) * k4);
+        uint32_t cb = grade_byte((double)(float)grade_curve((float)x, p1, k1, k2, k3) * k4);
+        for (j = 0, vs = 0; j < n; j++, vs = (vs - mv) & mv) {
+            double y = (double)j / nf;
+            uint32_t cr = grade_byte((double)(float)grade_curve((float)y, p0, k1, k2, k3) * k4);
+            uint32_t cd = grade_byte(grade_curve(y, p2, k1, k2, k3) * k4);
+            out[base + (us | vs)] = ca << 24 | cr << 16 | cb << 8 | cd;
+        }
+    }
+}
+
+void sub_000A3CA0(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    uint32_t k = MEM32(esp + 4), tab = MEM32(0x003E8C18u);
+    int32_t n = (int32_t)MEM32(0x0039D324u);
+    uint32_t e0 = esp, j;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    if (mode == 0 || n <= 0 || n > 256) {
+        sub_000A3CA0_gen();
+        return;
+    }
+    if (mode == 2) {
+        static unsigned long calls, bad;
+        size_t cnt = (size_t)n * (size_t)n * (k + 1u);
+        uint32_t *mine = malloc(cnt * 4u), sv_ebx = ebx, sv_esi = esi, sv_edi = edi;
+        int top = g_fp_top;
+        memcpy(mine, (const void *)XBOX_PTR(tab), cnt * 4u);
+        grade_table(mine, k, n);
+        sub_000A3CA0_gen();
+        calls++;
+        if ((memcmp(mine, (const void *)XBOX_PTR(tab), cnt * 4u) || g_fp_top != top
+             || esp != e0 + 4u || ebx != sv_ebx || esi != sv_esi || edi != sv_edi
+             || eax != k << 4 || ecx != MEM32(0x0039D30Cu + 16u * k)
+             || edx != MEM32(0x0039D310u + 16u * k) || g_ebp != e0 - 0x5Cu) && bad++ < 20) {
+            for (j = 0; j < cnt && mine[j] == MEM32(tab + 4u * j); j++)
+                ;
+            fprintf(stderr, "[native] sub_000A3CA0 mismatch: table %u, n %d, texel %u "
+                    "native %08X lifted %08X, ebp %08X (%08X)\n", k, n, j,
+                    j < cnt ? mine[j] : 0, j < cnt ? MEM32(tab + 4u * j) : 0, g_ebp, e0 - 0x5Cu);
+        }
+        if ((calls & 0x3FF) == 0)
+            fprintf(stderr, "[native] sub_000A3CA0: %lu calls, %lu mismatches\n", calls, bad);
+        free(mine);
+        return;
+    }
+    grade_table((uint32_t *)XBOX_PTR(tab), k, n);
+    for (j = 0; j < 4; j++)
+        MEM32(0x003E8BF0u + 16u * k + 4u * j) = MEM32(0x0039D304u + 16u * k + 4u * j);
+    eax = k << 4;
+    ecx = MEM32(0x0039D30Cu + 16u * k);
+    edx = MEM32(0x0039D310u + 16u * k);
+    g_ebp = g_seh_ebp = e0 - 0x5Cu;     /* the frame its last _ftol2 call published */
+    esp += 4;                           /* cdecl: return address only */
+}
+
+/* ── Movie colour conversion, sub_0025ECB4 ───────────────────
+ *
+ * cdecl (y, u, v, dst, dst_end): one row of a VP6 picture to A8R8G8B8, two
+ * pixels per step. MMX table lookups: four words per entry, Y at 0x3D0810,
+ * U at 0x3D1010, V at 0x3D1810 (256 x 8 bytes each); pixel = Y[y] + (U[u] +
+ * V[v]) with paddw wrap, packuswb to bytes. sub_0025F0B7 calls it for every
+ * row of every movie frame, and FFmpeg does not replace it: lifted it was
+ * the largest cost of a movie left after the decoder. Exact, including the
+ * registers it leaves behind. RECOMP_NATIVE=0 lifted, RECOMP_NATIVE_CHECK=1
+ * both and compare. */
+extern void sub_0025ECB4_gen(void);
+
+/* Last row written: lies in the movie texture (src/movie_crop.c). */
+uint32_t nfsu2_movie_row;
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+static inline __attribute__((unused)) uint8_t sat_u8(int16_t w)
+{
+    return w < 0 ? 0 : w > 255 ? 255 : (uint8_t)w;
+}
+
+static void yuv_row_native(uint32_t y, uint32_t u, uint32_t v, uint8_t *out, uint32_t n)
+{
+    const int16_t *ty = (const int16_t *)XBOX_PTR(0x003D0810u);
+    const int16_t *tu = (const int16_t *)XBOX_PTR(0x003D1010u);
+    const int16_t *tv = (const int16_t *)XBOX_PTR(0x003D1810u);
+    const uint8_t *py = (const uint8_t *)XBOX_PTR(y);
+    const uint8_t *pu = (const uint8_t *)XBOX_PTR(u);
+    const uint8_t *pv = (const uint8_t *)XBOX_PTR(v);
+    uint32_t i;
+#if defined(__aarch64__)
+    /* vadd wraps like paddw, vqmovun saturates like packuswb */
+    for (i = 0; i < n; i++, out += 8) {
+        int16x4_t c = vadd_s16(vld1_s16(tu + 4 * pu[i]), vld1_s16(tv + 4 * pv[i]));
+        int16x4_t w0 = vadd_s16(vld1_s16(ty + 4 * py[2 * i]), c);
+        int16x4_t w1 = vadd_s16(vld1_s16(ty + 4 * py[2 * i + 1]), c);
+        vst1_u8(out, vqmovun_s16(vcombine_s16(w0, w1)));
+    }
+#elif defined(__SSE2__)
+    for (i = 0; i < n; i++, out += 8) {
+        __m128i c = _mm_add_epi16(_mm_loadl_epi64((const __m128i *)(tu + 4 * pu[i])),
+                                  _mm_loadl_epi64((const __m128i *)(tv + 4 * pv[i])));
+        __m128i w = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(ty + 4 * py[2 * i])),
+                                       _mm_loadl_epi64((const __m128i *)(ty + 4 * py[2 * i + 1])));
+        w = _mm_add_epi16(w, _mm_unpacklo_epi64(c, c));
+        _mm_storel_epi64((__m128i *)out, _mm_packus_epi16(w, w));
+    }
+#else
+    int k;
+    for (i = 0; i < n; i++, out += 8) {
+        const int16_t *a = tu + 4 * pu[i], *b = tv + 4 * pv[i];
+        const int16_t *y0 = ty + 4 * py[2 * i], *y1 = ty + 4 * py[2 * i + 1];
+        for (k = 0; k < 4; k++) {
+            int16_t c = (int16_t)(a[k] + b[k]);
+            out[k] = sat_u8((int16_t)(y0[k] + c));
+            out[4 + k] = sat_u8((int16_t)(y1[k] + c));
+        }
+    }
+#endif
+}
+
+void sub_0025ECB4(void)
+{
+    static int mode = -1;               /* 0 lifted, 1 native, 2 native + check */
+    uint32_t y = MEM32(esp + 4), u = MEM32(esp + 8), v = MEM32(esp + 12);
+    uint32_t dst = MEM32(esp + 16), end = MEM32(esp + 20);
+    /* do-while in the original: at least one step, until dst == end */
+    uint32_t n = end > dst ? (end - dst) / 8u : 1u, last, k;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NATIVE"), *c = getenv("RECOMP_NATIVE_CHECK");
+        mode = (e && *e == '0') ? 0 : (c && *c == '1') ? 2 : 1;
+    }
+    if (mode == 0 || ((end - dst) & 7u) || n > 4096u) {
+        sub_0025ECB4_gen();
+        return;
+    }
+    if (mode == 2) {
+        static unsigned long rows, bad;
+        static uint8_t buf[4096 * 8];
+        yuv_row_native(y, u, v, buf, n);
+        sub_0025ECB4_gen();
+        rows++;
+        if (memcmp(buf, (const void *)XBOX_PTR(dst), n * 8u) && bad++ < 20)
+            fprintf(stderr, "[native] sub_0025ECB4 mismatch: row %lu at %08X\n", rows, dst);
+        if ((rows & 0xFFFF) == 0)
+            fprintf(stderr, "[native] sub_0025ECB4: %lu rows, %lu mismatches\n", rows, bad);
+        return;
+    }
+    nfsu2_movie_row = dst;
+    yuv_row_native(y, u, v, (uint8_t *)XBOX_PTR(dst), n);
+
+    /* What the last step leaves in the registers. */
+    last = n - 1u;
+    {
+        const int16_t *ty = (const int16_t *)XBOX_PTR(0x003D0810u);
+        const int16_t *tu = (const int16_t *)XBOX_PTR(0x003D1010u);
+        const int16_t *tv = (const int16_t *)XBOX_PTR(0x003D1810u);
+        const int16_t *a = tu + 4 * MEM8(u + last), *b = tv + 4 * MEM8(v + last);
+        const int16_t *y1 = ty + 4 * MEM8(y + 2u * last + 1u);
+        for (k = 0; k < 4; k++) {
+            mm3.w[k] = b[k];
+            mm2.w[k] = (int16_t)(a[k] + b[k]);
+            mm1.w[k] = (int16_t)(y1[k] + mm2.w[k]);
+        }
+        memcpy(&mm0, (const void *)XBOX_PTR(dst + 8u * last), 8);
+    }
+    eax = 0;
+    ecx = y + 2u * n;
+    edx = u + n;
+    esp += 4;                           /* cdecl: the caller pops the arguments */
+}
+
+/* ── Movie file names, sub_00129610 ──────────────────────────
+ *
+ * cdecl (buf, size, name): snprintf "%sMOVIES\\%s%s" -- the path of a movie
+ * with its language suffix (_en.vp6 ...). The last one is kept for
+ * src/movie_crop.c. */
+extern void sub_00129610_gen(void);
+
+char nfsu2_movie_name[64];
+
+void sub_00129610(void)
+{
+    uint32_t buf = MEM32(esp + 4), i;
+
+    sub_00129610_gen();
+    for (i = 0; i < sizeof nfsu2_movie_name - 1 && MEM8(buf + i); i++)
+        nfsu2_movie_name[i] = (char)MEM8(buf + i);
+    nfsu2_movie_name[i] = 0;
+    fprintf(stderr, "[movie] %s\n", nfsu2_movie_name);
+}
+
 /* ── DirectSound DSP command post (0x0032EB65) ───────────────
  *
  * thiscall, ecx = the DSP-side object. Copies a command block into the GP

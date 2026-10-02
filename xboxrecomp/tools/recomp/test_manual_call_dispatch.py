@@ -124,3 +124,30 @@ def test_split_translation_passes_manual_set_to_lifter():
             functions, output_dir, manual={TARGET})
 
     assert batch.translator.seen_manual == {TARGET}
+
+
+def _wrapped_lifter():
+    # A wrapped function: the project defines sub_X around the generated
+    # body, which func_db renames sub_X_gen.
+    lifter = Lifter(manual_functions={TARGET},
+                    func_db={TARGET: {"name": "sub_001E9100_gen"}})
+    lifter.wrapped_functions = {TARGET}
+    lifter.func_start = 0x00120000
+    lifter.func_end = 0x00120100
+    return lifter
+
+
+def test_wrapped_direct_call_calls_the_wrapper_directly():
+    generated = "\n".join(_wrapped_lifter().lift_instruction(_direct_call()))
+
+    assert "RECOMP_ABI_CALL(0x001E9100u, sub_001E9100)" in generated
+    assert "RECOMP_ICALL_SAFE" not in generated
+    assert "sub_001E9100_gen" not in generated
+
+
+def test_wrapped_tail_jump_calls_the_wrapper_directly():
+    generated = "\n".join(_wrapped_lifter().lift_instruction(_tail_jump()))
+
+    assert "sub_001E9100();" in generated
+    assert "RECOMP_ITAIL" not in generated
+    assert "sub_001E9100_gen" not in generated

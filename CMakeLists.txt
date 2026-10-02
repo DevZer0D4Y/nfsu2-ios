@@ -44,6 +44,7 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/switch_nx.c
     src/text_patch.c
+    src/movie_crop.c
 )
 
 if(WIN32)
@@ -97,8 +98,22 @@ else()
     else()
         set(NFSU2_GEN_OPT "-O1" CACHE STRING "Optimisation for the lifted code")
     endif()
+    # NFSU2_LTO: link-time optimisation of the lifted code and its manual
+    # overrides, so lifted callers inline each other and the native leaves
+    # (_ftol2, ...). The runtime and renderers are compiled as usual.
+    # NFSU2_LTO_JOBS parallel LTRANS jobs (memory: ~1-2 GB each).
+    option(NFSU2_LTO "Link-time optimisation of the lifted code" OFF)
+    set(NFSU2_LTO_JOBS "4" CACHE STRING "Parallel LTO link jobs")
+    set(NFSU2_GEN_FLAGS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+    if(NFSU2_LTO)
+        list(APPEND NFSU2_GEN_FLAGS "-flto=auto")
+        set_property(SOURCE src/recomp_manual.c APPEND PROPERTY
+            COMPILE_OPTIONS "-flto=auto;-fno-strict-aliasing;-fwrapv")
+        target_link_options(${PROJECT_NAME} PRIVATE
+            "-flto=${NFSU2_LTO_JOBS}" "-flto-partition=balanced" ${NFSU2_GEN_OPT})
+    endif()
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+        COMPILE_OPTIONS "${NFSU2_GEN_FLAGS}")
     target_link_libraries(${PROJECT_NAME} PRIVATE m)
 endif()
 
@@ -111,7 +126,7 @@ if(NINTENDO_SWITCH)
     set(NFSU2_SWITCH_APP_NAME "NFS Underground 2 (Xbox recomp)" CACHE STRING
         "Title shown in the homebrew menu")
     set(NFSU2_SWITCH_AUTHOR "nfsu2-xbox" CACHE STRING "Author shown in the homebrew menu")
-    set(NFSU2_SWITCH_VERSION "0.3" CACHE STRING "Version shown in the homebrew menu")
+    set(NFSU2_SWITCH_VERSION "0.4" CACHE STRING "Version shown in the homebrew menu")
     set(NFSU2_SWITCH_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg" CACHE FILEPATH
         "256x256 JPEG icon (libnx default when empty)")
 

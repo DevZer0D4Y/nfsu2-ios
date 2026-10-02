@@ -227,6 +227,17 @@ int nv2a_gl_vsh_program(const uint32_t (*prog)[4], uint32_t slots,
     return o.overflow ? -1 : (int)(cap - o.left);
 }
 
+/* The NV2A rasterizer takes screen positions as fixed point with a 4-bit
+ * fraction, truncated (xemu's roundScreenCoords). Xbox D3D's viewport
+ * offset carries a +0.53125 bias, so a clip-space full-screen pass starts at
+ * 0.53125 -- 0.5 on the hardware, which covers row and column 0; unsnapped,
+ * GL left them out and NFSU2's glow buffer kept a stale edge that its
+ * composite added back as a light line at the top and left. */
+#define NV2A_SNAP_GLSL \
+    "vec2 nv2a_snap(vec2 sw, float w) {\n" \
+    "    return w > 0.0 ? trunc(sw / w * 16.0) / 16.0 * w : sw;\n" \
+    "}\n"
+
 /* Everything around the program body: inputs, the register file, the ILU
  * helpers (same constants as the interpreter), and the three position
  * paths. u_xform selects the path at run time so one program object serves
@@ -285,8 +296,10 @@ static const char s_vk_prelude[] =
      * vertex is clipped by x/y anyway and its true z is about w: clamping it
      * to 0 skewed the interpolated depth of triangles crossing the eye plane
      * (walls in hood view turned transparent, objects showed through them). */
+    NV2A_SNAP_GLSL
     "vec4 nv2a_clip(vec3 sw, float w) {\n"
     "    float z = sw.z * u_surf.z;\n"
+    "    sw.xy = nv2a_snap(sw.xy, w);\n"
     "    return vec4(sw.x * u_surf.x - w, sw.y * u_surf.y - w,\n"
     "                w > 0.0 ? clamp(z, 0.0, w) : z, w);\n"
     "}\n";
@@ -345,8 +358,10 @@ const char *nv2a_gl_vsh_prelude(void)
          * clipping at the near and far planes, and GL_DEPTH_CLAMP alone did
          * not reach every driver -- on Eden NFSU2's loading screen, drawn at
          * z = 1.0, still vanished. */
+        NV2A_SNAP_GLSL
         "vec4 nv2a_clip(vec3 sw, float w) {\n"
         "    float z = sw.z * u_surf.z * 2.0 - w;\n"
+        "    sw.xy = nv2a_snap(sw.xy, w);\n"
         "    return vec4(sw.x * u_surf.x - w, sw.y * u_surf.y - w,\n"
         "                clamp(z, -abs(w), abs(w)), w);\n"
         "}\n";

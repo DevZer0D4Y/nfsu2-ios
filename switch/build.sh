@@ -22,6 +22,10 @@
 #                    BUILD_DIR (default /root/nfsu2x/build-switch-vk) against
 #                    NVK_SDK (mesa-switch install, default /root/nfsu2x/mesa-sdk/usr/local)
 #                    and GLSLANG_DIR (glslang for the Switch, default /root/nfsu2x/glslang-switch)
+#   LTO=1            link-time optimisation of the lifted code (NFSU2_LTO):
+#                    BUILD_DIR gets a -lto suffix and the NRO is staged as
+#                    nfsu2x[-vulkan]-lto.nro next to the normal one, for A/B.
+#                    LTO_JOBS parallel link jobs (default 4, ~2 GB each)
 #   FFMPEG_DIR       VP6-only LGPL FFmpeg for the movies (tools/build_ffmpeg_vp6.sh
 #                    switch; default /root/nfsu2x/ffmpeg-vp6-switch). Without
 #                    it the lifted (slow) decoder plays them.
@@ -45,6 +49,13 @@ else
     BUILD="${BUILD_DIR:-/root/nfsu2x/build-switch}"
     NRO_NAME=nfsu2x.nro
     VK_ARGS=(-DNFSU2_VULKAN=OFF)
+fi
+
+LTO_ARGS=(-DNFSU2_LTO=OFF)
+if [ "${LTO:-0}" = "1" ]; then
+    [ -z "${BUILD_DIR:-}" ] && BUILD="$BUILD-lto"
+    NRO_NAME="${NRO_NAME%.nro}-lto.nro"
+    LTO_ARGS=(-DNFSU2_LTO=ON -DNFSU2_LTO_JOBS="${LTO_JOBS:-4}")
 fi
 
 FFMPEG_DIR="${FFMPEG_DIR:-/root/nfsu2x/ffmpeg-vp6-switch}"
@@ -71,7 +82,8 @@ cmake -S "$REPO" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
     -DXBOXRECOMP_DIR="$TK" -DNFSU2_GEN_DIR="$GEN" \
-    -DNFSU2_SWITCH_ICON="$REPO/assets/icon.jpg" "${VK_ARGS[@]}" "${FF_ARGS[@]}" >/dev/null
+    -DNFSU2_SWITCH_ICON="$REPO/assets/icon.jpg" "${VK_ARGS[@]}" "${FF_ARGS[@]}" \
+    "${LTO_ARGS[@]}" >/dev/null
 ninja -C "$BUILD" -j"$JOBS"
 
 DEST="$SD/switch/nfsu2x"

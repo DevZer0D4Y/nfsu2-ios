@@ -999,6 +999,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->clip_x          = s_gpu.clip_x;
+    out->clip_y          = s_gpu.clip_y;
 }
 
 static int sample_texture(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
@@ -2289,6 +2291,8 @@ static uint16_t raw_direct_attrs(Nv2aRawBatch *rb, uint16_t present,
 
 static void attr_const_init(void);
 
+void (*nv2a_raw_batch_hook)(Nv2aRawBatch *rb, float *attrs);
+
 static void raw_batch(void)
 {
     Nv2aRawBatch rb;
@@ -2377,6 +2381,8 @@ static void raw_batch(void)
     rb.attr_const_gen = s_gpu.attr_const_gen;
     rb.vp_prog_gen = s_vp.prog_gen ? s_vp.prog_gen : 1;
     rb.vp_const_gen = s_vp.const_gen ? s_vp.const_gen : 1;
+    if (nv2a_raw_batch_hook)
+        nv2a_raw_batch_hook(&rb, s_raw_attrs);
     s_backend->draw_raw(&rb);
     s_gpu.tris_drawn += s_gpu.idx_count / 3;
     s_gpu.drawn_offset = s_gpu.color_offset;
@@ -3109,7 +3115,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
-    {
+    /* The shadow is the 3D class's register file: methods to the other
+     * subchannels (2D surfaces, blits) share its offsets and must not land
+     * in it. NV062's SET_OFFSET_SOURCE is 0x0308 = SET_CULL_FACE_ENABLE: a
+     * blit before NFSU2's loading screen (main menu -> Career / Quick Race)
+     * switched culling on with the menu car's FRONT/CW state and culled the
+     * whole screen. */
+    if (subch == 0) {
         uint32_t w = (method & 0x1FFCu) / 4;
         if (s_reg[w] != param) {
             s_reg[w] = param;

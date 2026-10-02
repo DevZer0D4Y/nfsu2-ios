@@ -2863,10 +2863,54 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Vblank schedule.
+ *
+ * The tick is 59.94 Hz on a microsecond clock, drift-free (next += period),
+ * and the timer thread sleeps only until it is due (kernel_vblank_wait_ms).
+ * It used to be "now + 16 ms" checked on a 10 ms wait: late and drifting,
+ * ~46 Hz in a Linux race, and NFSU2 flips every second vblank -- so races
+ * ran at 23 fps instead of 30 (Linux, 2026-10-02: 23 -> 30 fps).
+ *
+ * Late frames need nothing more: NFSU2's D3D flips a frame that missed its
+ * vblank as soon as it is queued (sub_002F2080, the immediate-when-late
+ * flag), so frame times are not quantised to whole vblanks. */
+#define VBLANK_PERIOD_US 16683                    /* 59.94 Hz */
+
+static long long vb_now_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (long long)((double)c.QuadPart * 1e6 / (double)f.QuadPart);
+}
+
+static long long     s_vb_next_us;                /* when the next vblank is due */
+static volatile LONG s_vb_count;                  /* vblanks delivered */
+
+/* For the fps reports: "vblank 59.9 Hz" since the previous call, dt s ago. */
+void xbox_vblank_report(double dt, char *buf, size_t n)
+{
+    static uint32_t last;
+    uint32_t c = (uint32_t)s_vb_count;
+    snprintf(buf, n, "vblank %.1f Hz", dt > 0 ? (c - last) / dt : 0.0);
+    last = c;
+}
+
+/* How long the timer thread may sleep before the next vblank is due. */
+static DWORD kernel_vblank_wait_ms(void)
+{
+    long long d = s_vb_next_us - vb_now_us();
+    if (d <= 0)
+        return 1;
+    d = (d + 999) / 1000;
+    return d > 10 ? 10 : (DWORD)d;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
     long long now;
 
     if (enabled < 0)
@@ -2874,10 +2918,16 @@ static void kernel_vblank_tick(void)
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    now = vb_now_us();
+    if (!s_vb_next_us)
+        s_vb_next_us = now;
+    if (now < s_vb_next_us)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
+        s_vb_next_us = now + VBLANK_PERIOD_US;    /* far behind: restart here */
+    else
+        s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
+    InterlockedIncrement(&s_vb_count);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -3222,7 +3272,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        WaitForSingleObject(xbox_irq_line_event(), 10);   /* a device interrupt, or 10 ms */
+        /* a device interrupt, the next vblank, or 10 ms */
+        WaitForSingleObject(xbox_irq_line_event(), kernel_vblank_wait_ms());
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */

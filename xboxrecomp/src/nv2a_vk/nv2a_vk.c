@@ -308,12 +308,40 @@ static void end_rendering(void)
     }
 }
 
+static VkRect2D s_sc_cur;               /* scissor set in this pass */
+
 static void set_viewport(uint32_t pw, uint32_t ph)
 {
     VkViewport vp = { 0, 0, (float)pw, (float)ph, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, { pw, ph } };
     vkCmdSetViewport(s_cb, 0, 1, &vp);
     vkCmdSetScissor(s_cb, 0, 1, &sc);
+    s_sc_cur = sc;
+}
+
+/* SET_SURFACE_CLIP as the scissor, in s's stored pixels. NFSU2's split
+ * screen draws each player's world with the clip set to that player's
+ * half; the vertex programs place it there but do not stop at the edge.
+ * Same as nv2a_gl.c (and xemu). Call inside the pass (begin_rendering
+ * resets it to the whole surface). */
+static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
+{
+    uint32_t x0 = (r[0x200 / 4] & 0xFFFF) * s->aa_sx, x1 = x0 + (r[0x200 / 4] >> 16) * s->aa_sx;
+    uint32_t y0 = (r[0x204 / 4] & 0xFFFF) * s->aa_sy, y1 = y0 + (r[0x204 / 4] >> 16) * s->aa_sy;
+    VkRect2D sc = { { 0, 0 }, { s->pw, s->ph } };
+
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+    if (x1 > x0 && y1 > y0) {
+        sc.offset.x = (int32_t)to_stored(x0, s->pw, s->w);
+        sc.offset.y = (int32_t)to_stored(y0, s->ph, s->h);
+        sc.extent.width = to_stored(x1, s->pw, s->w) - (uint32_t)sc.offset.x;
+        sc.extent.height = to_stored(y1, s->ph, s->h) - (uint32_t)sc.offset.y;
+    }
+    if (memcmp(&sc, &s_sc_cur, sizeof sc)) {
+        vkCmdSetScissor(s_cb, 0, 1, &sc);
+        s_sc_cur = sc;
+    }
 }
 
 static void begin_rendering(VkSurf *s, VkDepthBuf *d)
@@ -443,10 +471,15 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     VkSurf *s = surf_find(va), *victim = NULL;
     int i;
 
-    if (s && s->w == w && s->h == h) {
+    /* h is the surface clip, not the allocation (NFSU2's split screen clips
+     * the back buffer to each player's half): keep the surface while the
+     * clip fits, grow it when it does not. Same as nv2a_gl.c. */
+    if (s && s->w == w && s->h >= h) {
         s->used = s_frame;
         return s;
     }
+    if (s && s->w == w && s->h > h)
+        h = s->h;
     if (!s) {
         for (i = 0; i < VK_MAX_SURF; i++) {
             if (!s_surf[i].image) { victim = &s_surf[i]; break; }
@@ -529,11 +562,11 @@ static VkSurf *target(const Nv2aSurface *sf, uint32_t zeta_va, VkDepthBuf **dout
 {
     uint32_t bpp = sf->bytes_per_pixel ? sf->bytes_per_pixel : 4;
     uint32_t w = sf->pitch ? sf->pitch / bpp : sf->width;
-    uint32_t h = sf->height;
+    uint32_t h = sf->clip_y + sf->height;   /* the clip need not start at 0 */
     VkSurf *s;
 
     *dout = NULL;
-    if (w < sf->width) w = sf->width;
+    if (w < sf->clip_x + sf->width) w = sf->clip_x + sf->width;
     if (!w || !h || !sf->color_va || w > 4096 || h > 4096)
         return NULL;
     s = surf_get(sf->color_va, w, h, sf->aa_sx ? sf->aa_sx : 1, sf->aa_sy ? sf->aa_sy : 1);
@@ -858,6 +891,19 @@ static VkSampler sampler_get(uint32_t key)
     return s_samplers[s_nsamplers++].s;
 }
 
+/* A surface kept taller than its clip (surf_get) and sampled as a texture
+ * of the clip's size: texcoords cover the w x h texels at the top left, not
+ * the whole surface. A texture of the surface's logical or real size keeps
+ * the old full-surface mapping (anti-aliased surfaces). */
+static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
+                     uint32_t aa_sx, uint32_t aa_sy, float scale[2])
+{
+    uint32_t lw = sw / (aa_sx ? aa_sx : 1), lh = sh / (aa_sy ? aa_sy : 1);
+
+    if (w < lw) scale[0] *= (float)w / (float)lw;
+    if (h < lh) scale[1] *= (float)h / (float)lh;
+}
+
 /* Stage i: its image view (a surface or a cached texture), sampler and
  * texcoord scale. Records uploads, so call it outside rendering or accept
  * that it ends the pass. */
@@ -898,6 +944,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     if (rt) {
         out->imageView = rt->view;
         *sampled = rt;
+        rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
     } else {
         uint32_t texs = s_hz_texs;
         uint64_t t0 = hz_now();
@@ -2491,6 +2538,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         cur_pipe_gen = s_cb_gen;
     }
     apply_dynamic(r, d != NULL, topo);
+    set_surface_scissor(r, s);
 
     /* Uniforms. */
     {
@@ -2749,7 +2797,11 @@ static void vk_flip(void)
             clock_gettime(CLOCK_MONOTONIC, &now);
             dt = (double)(now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
             if (dt >= 10.0) {
-                fprintf(stderr, "[fps] %.1f fps (frame %u)\n", (s_frame - last_frame) / dt, s_frame);
+                extern void xbox_vblank_report(double, char *, size_t);
+                char vb[128];
+                xbox_vblank_report(dt, vb, sizeof vb);
+                fprintf(stderr, "[fps] %.1f fps (frame %u), %s\n",
+                        (s_frame - last_frame) / dt, s_frame, vb);
                 last_frame = s_frame;
                 last = now;
             }

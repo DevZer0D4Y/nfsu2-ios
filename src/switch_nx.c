@@ -240,14 +240,17 @@ void xbox_perf_sample(void);
 uint32_t nv2a_gl_program_count(void);
 int   mcpx_apu_frames_per_second(void);
 float mcpx_apu_utilization(void);
+void  xbox_vblank_report(double dt, char *buf, size_t n);   /* kernel_bridge.c */
 
 static void perf_report(void)
 {
     static uint32_t last_frames, last_seen;
     uint32_t f = nv2a_gl_frame_count();
-    fprintf(stderr, "[perf] %.1f fps, textures %llu MB, %u shader programs\n",
+    char vb[128];
+    xbox_vblank_report(10.0, vb, sizeof vb);
+    fprintf(stderr, "[perf] %.1f fps, textures %llu MB, %u shader programs, %s\n",
             (f - last_frames) / 10.0,
-            (unsigned long long)(nv2a_gl_texture_bytes() >> 20), nv2a_gl_program_count());
+            (unsigned long long)(nv2a_gl_texture_bytes() >> 20), nv2a_gl_program_count(), vb);
     /* 1500 frames/s is real time; below it, movies (clocked by DirectSound's
      * play cursor) run slow. */
     fprintf(stderr, "[perf] APU %d frames/s (1500 = real time), frame thread %.0f%% busy\n",
@@ -894,6 +897,155 @@ static void prof_start(void)
             (void *)&_start);
 }
 
+/* ── Clocks ───────────────────────────────────────────────────────
+ *
+ * NFSU2_CPU_MHZ / NFSU2_GPU_MHZ / NFSU2_MEM_MHZ in nfsu2x_env.txt: run the
+ * CPU, GPU and memory at that clock (the closest the hardware lists, never
+ * above the request; capped at 1785 / 921.6 / 1600 MHz). Unset = the
+ * system's (CPU 1020 MHz in every official profile that has a usable GPU).
+ * The CPU is what limits this port: the game thread, the pushbuffer
+ * executor and the GL/Vulkan thread are all CPU-bound. Through clkrst
+ * (8.0.0+) or pcv, as sys-clk does; the old rates come back on exit. The
+ * system resets clocks on dock/undock and after sleep, so a thread applies
+ * them again every second while the game has focus. More heat and battery:
+ * opt-in. sys-clk, when installed, may override them with its own profile. */
+static struct {
+    const char *env, *name;
+    PcvModule mod;
+    PcvModuleId id;
+    u32 cap_hz, want_hz, old_hz, set_hz;
+    int open;
+    ClkrstSession s;
+} s_clk[3] = {
+    { "NFSU2_CPU_MHZ", "CPU", PcvModule_CpuBus, PcvModuleId_CpuBus, 1785000000u },
+    { "NFSU2_GPU_MHZ", "GPU", PcvModule_GPU,    PcvModuleId_GPU,    921600000u },
+    { "NFSU2_MEM_MHZ", "memory", PcvModule_EMC, PcvModuleId_EMC,    1600000000u },
+};
+static int s_clk_rst = -1;                 /* 1 clkrst, 0 pcv, -1 not up */
+static volatile int s_clk_stop;
+static Thread s_clk_thread;
+static int s_clk_thread_up;
+
+static Result clk_get(int i, u32 *hz)
+{
+    return s_clk_rst ? clkrstGetClockRate(&s_clk[i].s, hz) : pcvGetClockRate(s_clk[i].mod, hz);
+}
+
+static Result clk_set(int i, u32 hz)
+{
+    return s_clk_rst ? clkrstSetClockRate(&s_clk[i].s, hz) : pcvSetClockRate(s_clk[i].mod, hz);
+}
+
+/* The highest listed rate not above want (want itself when there is no list). */
+static u32 clk_pick(int i, u32 want)
+{
+    u32 rates[64], best = 0;
+    s32 n = 0;
+    PcvClockRatesListType type;
+    Result rc = s_clk_rst
+        ? clkrstGetPossibleClockRates(&s_clk[i].s, rates, 64, &type, &n)
+        : pcvGetPossibleClockRates(s_clk[i].mod, rates, 64, &type, &n);
+    if (R_FAILED(rc) || n <= 0 || type != PcvClockRatesListType_Discrete)
+        return want;
+    for (s32 k = 0; k < n; k++)
+        if (rates[k] <= want && rates[k] > best)
+            best = rates[k];
+    return best ? best : want;
+}
+
+static void clk_restore(void)
+{
+    int i;
+    if (s_clk_rst < 0)
+        return;
+    s_clk_stop = 1;
+    if (s_clk_thread_up) {
+        threadWaitForExit(&s_clk_thread);
+        threadClose(&s_clk_thread);
+        s_clk_thread_up = 0;
+    }
+    for (i = 0; i < 3; i++)
+        if (s_clk[i].set_hz && s_clk[i].old_hz)
+            clk_set(i, s_clk[i].old_hz);
+    for (i = 0; i < 3; i++)
+        if (s_clk[i].open)
+            clkrstCloseSession(&s_clk[i].s);
+    if (s_clk_rst)
+        clkrstExit();
+    else
+        pcvExit();
+    s_clk_rst = -1;
+}
+
+static void clk_keeper(void *arg)
+{
+    unsigned logged = 0;
+    (void)arg;
+    while (!s_clk_stop) {
+        svcSleepThread(1000000000ull);
+        if (s_clk_stop || appletGetFocusState() != AppletFocusState_InFocus)
+            continue;
+        for (int i = 0; i < 3; i++) {
+            u32 hz = 0;
+            if (!s_clk[i].set_hz || R_FAILED(clk_get(i, &hz)) || hz == s_clk[i].set_hz)
+                continue;
+            clk_set(i, s_clk[i].set_hz);
+            if (logged++ < 8)
+                printf("[clock] %s was reset to %u MHz, back to %u MHz\n", s_clk[i].name,
+                       hz / 1000000u, s_clk[i].set_hz / 1000000u);
+        }
+    }
+}
+
+static void clk_apply(void)
+{
+    int i, any = 0;
+    for (i = 0; i < 3; i++) {
+        const char *e = getenv(s_clk[i].env);
+        double mhz = e ? atof(e) : 0;
+        s_clk[i].want_hz = mhz > 0 ? (u32)(mhz * 1e6 + 0.5) : 0;
+        if (s_clk[i].want_hz > s_clk[i].cap_hz)
+            s_clk[i].want_hz = s_clk[i].cap_hz;
+        any |= s_clk[i].want_hz != 0;
+    }
+    if (!any)
+        return;
+    if (hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()))
+        s_clk_rst = 1;
+    else if (R_SUCCEEDED(pcvInitialize()))
+        s_clk_rst = 0;
+    else {
+        printf("[clock] neither clkrst nor pcv is available: clocks unchanged\n");
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        u32 hz = 0, now = 0;
+        Result rc;
+        if (!s_clk[i].want_hz)
+            continue;
+        if (s_clk_rst) {
+            if (R_FAILED(rc = clkrstOpenSession(&s_clk[i].s, s_clk[i].id, 3))) {
+                printf("[clock] %s: no clkrst session (0x%X)\n", s_clk[i].name, rc);
+                continue;
+            }
+            s_clk[i].open = 1;
+        }
+        clk_get(i, &s_clk[i].old_hz);
+        hz = clk_pick(i, s_clk[i].want_hz);
+        rc = clk_set(i, hz);
+        clk_get(i, &now);
+        if (R_SUCCEEDED(rc))
+            s_clk[i].set_hz = now ? now : hz;
+        printf("[clock] %s %u -> %u MHz (asked %u)%s\n", s_clk[i].name,
+               s_clk[i].old_hz / 1000000u, now / 1000000u, s_clk[i].want_hz / 1000000u,
+               R_FAILED(rc) ? " -- refused" : "");
+    }
+    atexit(clk_restore);
+    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x3F, -2))
+        && R_SUCCEEDED(threadStart(&s_clk_thread)))
+        s_clk_thread_up = 1;
+}
+
 void switch_boot(void)
 {
     s_t0 = armGetSystemTick();
@@ -927,12 +1079,34 @@ void switch_boot(void)
                         : "applet mode: launch via a game title (hold R) for full memory",
                (unsigned long)(total >> 20), (unsigned long)(used >> 20));
     }
+    clk_apply();
     loader_start();
     prof_start();
 }
 
+void switch_error_dialog(const char *msg, const char *details)
+{
+    AppletType at = appletGetAppletType();
+    Result rc;
+    log_flush(1);
+    if (at == AppletType_Application || at == AppletType_SystemApplication) {
+        ErrorApplicationConfig c;
+        rc = errorApplicationCreate(&c, msg, details);
+        if (R_SUCCEEDED(rc))
+            rc = errorApplicationShow(&c);
+    } else {
+        ErrorSystemConfig c;
+        rc = errorSystemCreate(&c, msg, details);
+        if (R_SUCCEEDED(rc))
+            rc = errorSystemShow(&c);
+    }
+    if (R_FAILED(rc))
+        fprintf(stderr, "[switch] error applet failed (0x%X)\n", rc);
+}
+
 void switch_shutdown(void)
 {
+    clk_restore();
     log_flush(1);
     socketExit();
 }

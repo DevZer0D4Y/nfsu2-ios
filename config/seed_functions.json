@@ -62,5 +62,9 @@
  {
   "start": "0x0033AAD3",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000930D0",
+  "note": "Indirect-call target observed at runtime (thiscall method, after int3 padding; races call it every frame); decodes as a function body."
  }
 ]

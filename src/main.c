@@ -30,6 +30,10 @@
 /* libnx lives in switch_nx.c: <switch.h> and the Win32 vocabulary collide. */
 void switch_boot(void);
 void switch_shutdown(void);
+void switch_error_dialog(const char *msg, const char *details);
+#elif !defined(_WIN32)
+int SDL_ShowSimpleMessageBox(uint32_t flags, const char *title, const char *message,
+                             void *window);
 #endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
@@ -227,8 +231,12 @@ static void *load_file(const char *path, size_t *out_size)
 static void fatal(const char *msg)
 {
     fprintf(stderr, "[FATAL] %s\n", msg);
-#ifdef _WIN32
+#if defined(_WIN32)
     MessageBoxA(NULL, msg, "NFSU2 recomp", MB_ICONERROR);
+#elif defined(__SWITCH__)
+    switch_error_dialog(msg, NULL);
+#else
+    SDL_ShowSimpleMessageBox(0x10, "NFSU2 recomp", msg, NULL);
 #endif
 }
 

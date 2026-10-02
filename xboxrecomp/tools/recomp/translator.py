@@ -2972,6 +2972,7 @@ class BatchTranslator:
         # renamed every direct call site with it, so the wrapper only ever
         # ran when something reached it through a function pointer.
         self.translator.lifter.manual_functions = manual | wrapped
+        self.translator.lifter.wrapped_functions = wrapped
         manual_decls = {}
 
         # Translate all functions first, collecting results
@@ -3022,6 +3023,7 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        defined |= {f"sub_{a:08X}" for a in wrapped}  # the project's wrappers
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
