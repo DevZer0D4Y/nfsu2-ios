@@ -316,8 +316,27 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
-        g_controller_connected[dwPort] = FALSE;
-        return ERROR_DEVICE_NOT_CONNECTED;
+        /* Nothing calls xbox_InputInit, and pads come and go (macOS also
+         * reports them only some time after start): look again, at most
+         * once a second per port. */
+        static DWORD last_scan[XBOX_MAX_CONTROLLERS];
+        DWORD now = GetTickCount();
+        if (now - last_scan[dwPort] >= 1000) {
+            last_scan[dwPort] = now;
+            if (c) {
+                SDL_GameControllerClose(c);
+                g_pads[dwPort] = NULL;
+            }
+            xbox_InputInit();
+            c = g_pads[dwPort];
+            if (c)
+                fprintf(stderr, "  [INPUT] port %lu: %s\n", (unsigned long)dwPort,
+                        SDL_GameControllerName(c) ? SDL_GameControllerName(c) : "controller");
+        }
+        if (!c || !SDL_GameControllerGetAttached(c)) {
+            g_controller_connected[dwPort] = FALSE;
+            return ERROR_DEVICE_NOT_CONNECTED;
+        }
     }
 
     SDL_GameControllerUpdate();

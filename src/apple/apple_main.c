@@ -60,7 +60,9 @@ int main(int argc, char **argv)
 
     (void)argc;
     (void)argv;
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    /* Controllers too: macOS delivers their arrival and input through the
+     * main run loop, which only this thread pumps. */
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[apple] SDL video: %s\n", SDL_GetError());
         return 1;
     }
