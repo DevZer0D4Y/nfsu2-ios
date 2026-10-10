@@ -467,3 +467,25 @@ New file: `src/apple/apple_main.c`.
     This also covers late discovery and reconnects. It logs `[INPUT] port N: <name>`.
 - Verified: `[INPUT] port 0: DualSense Wireless Controller`, `InputGetState=0` once a second
   (`RECOMP_INPUT_DIAG=1`). Button presses still need checking by hand.
+- Controller confirmed working by the owner (DualSense: Options = Start, Cross = A).
+
+### GPU load on macOS (owner report: "GPU at 100%")
+
+Sampled `ioreg` IOAccelerator "Device Utilization %" once a second, 2026-10-10:
+
+| Situation | Device utilization |
+|---|---|
+| Game closed (Spotify helper/renderer, WindowServer, browser running) | 62–72% |
+| Main menu, default | ≈99% (12 s average) |
+| Main menu, `RECOMP_GL_SCALE=0.5` | ≈97% |
+
+- Most of the "100%" is the Mac's existing load; the game adds about 30+ points and saturates the GPU.
+- Half the render resolution barely changes it, so the cost is not fill-rate. It is per-draw work: about
+  356 draws/frame (`[cull]` line), ≈21k draws/s, each going through `nv2a_gl`, then Apple's OpenGL → Metal
+  translation layer.
+- The game still holds 53–60 fps with a 59.9 Hz vblank, so it is not GPU-limited. Apple's utilization is
+  relative to the current GPU clock (DVFS).
+- Not fixed in Phase 0: upstream freezes `nv2a_gl` ("renderer work goes into Vulkan only"). The
+  Vulkan-on-MoltenVK fallback (Phase 1) or the native Metal renderer (Phase 3) removes the GL translation
+  layer.
+- For a precise breakdown: `sudo powermetrics --samplers gpu_power` (GPU frequency and active residency).
