@@ -149,6 +149,13 @@ __attribute__((weak)) int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *su
 }
 #endif
 
+/* Called before every submission and swapchain acquire. A host whose GPU
+ * work is forbidden at times (iOS kills an app that submits from the
+ * background) blocks here until it may submit again. */
+__attribute__((weak)) void nv2a_vk_host_gate(void)
+{
+}
+
 static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
 {
     uint32_t i;
@@ -2311,6 +2318,7 @@ static void flush_frame_wait(void)
     vkEndCommandBuffer(s_cb);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s_cb;
+    nv2a_vk_host_gate();
     vkQueueSubmit(s_queue, 1, &si, s_f->fence);
     vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(s_dev, 1, &s_f->fence);
@@ -3432,6 +3440,7 @@ static void vk_flip(void)
     barrier_all();
 
     VT("flip %u: surface %08X drew %d, acquiring\n", s_frame, s ? s->va : 0, s_drew_any);
+    nv2a_vk_host_gate();                   /* covers this frame's submit too */
     if (!s_headless) {
         VkResult rr = vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX, s_f->acquired,
                                             VK_NULL_HANDLE, &idx);

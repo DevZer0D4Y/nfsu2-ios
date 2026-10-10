@@ -572,3 +572,62 @@ Owner approved the >20-line change to `nv2a_vk.c`.
   0 pipeline failures. Checked from `simctl io screenshot`.
 - Gotcha: `simctl launch --stdout/--stderr` into a file that an earlier, still-running instance writes to
   gives misleading logs; terminate first and use fresh file names.
+
+## 2026-10-10 — **Phase 1 milestone: runs on an iPhone 13 Pro**
+
+Device: iPhone 13 Pro (iPhone14,2, A15, 6 GB), iOS 27. Signing: paid Individual team `YOURTEAMID`,
+automatic signing with the team's wildcard profile, bundle ID `com.yourname.nfsu2x`.
+**No special entitlements were needed.**
+
+Build and deploy:
+```sh
+tools/build_ios_deps.sh device
+cmake -S . -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_PREFIX_PATH=$HOME/nfsu2/deps/device \
+  -DCMAKE_FIND_ROOT_PATH=$HOME/nfsu2/deps/device -DNFSU2_GEN_DIR=$PWD/gen -DNFSU2_VULKAN=ON \
+  -DNFSU2_IOS_BUNDLE_ID=com.yourname.nfsu2x -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=YOURTEAMID \
+  -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_STYLE=Automatic -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="Apple Development"
+xcodebuild -project build-ios/nfsu2_recomp.xcodeproj -scheme nfsu2_recomp -configuration Release \
+  -destination 'generic/platform=iOS' -allowProvisioningUpdates build
+xcrun devicectl device install app --device <UDID> build-ios/Release-iphoneos/nfsu2_recomp.app
+xcrun devicectl device copy to --device <UDID> --domain-type appDataContainer \
+  --domain-identifier com.yourname.nfsu2x --source ~/nfsu2/game --destination Documents/game   # 76 s, 2.5 GB
+```
+After a CMake change, re-run `cmake build-ios` before `xcodebuild`: the regeneration did not pick up
+`ios_vm.c` by itself.
+
+Device runs:
+1. `[ios] no connected window scene`, then `CreateFileMapping failed (error 8)`, then FATAL (black screen).
+   - **The sandbox refuses `shm_open`** (the Simulator does not).
+   - On a device the window scene connects after launch.
+   - **Fixes:** `xboxrecomp/src/platform/ios_vm.c` backs file mappings with a named Mach memory entry
+     (`mach_make_memory_entry_64(MAP_MEM_NAMED_CREATE)`, views with `vm_map(... VM_FLAGS_FIXED |
+     VM_FLAGS_OVERWRITE)` after the existing `mach_map_fixed` claim). `win32_compat.c` swaps only the
+     create, map and close calls under `TARGET_OS_IPHONE`. `ios_scene.m` turns the run loop (up to 2 s)
+     until the scene connects.
+2. **The whole memory model maps on iOS without extended-virtual-addressing:** base `0x7000000000`, RAM
+   + 28/28 mirrors, extended VMA, contiguous window, NV2A/MCPX/flash apertures, tiled alias verified.
+   Vulkan runs on `Apple A15 GPU`; EA logo and THX play. Then
+   `kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted` → `VK_ERROR_DEVICE_LOST`: the app
+   went to the background (auto-lock during the movies). **Fixes:** `SDL_HINT_IDLE_TIMER_DISABLED`, and a
+   lifecycle gate: `apple_main.c` follows `SDL_APP_WILLENTERBACKGROUND` / `DIDENTERFOREGROUND` (event
+   watch, main thread), and `nv2a_vk.c` calls a weak `nv2a_vk_host_gate()` before every acquire/submit,
+   which blocks in the background. The guest then stalls behind its pushbuffer.
+3. **Runs well (owner confirmed):**
+   - movies with sound (CoreAudio), profile load, main menu at 59–60 fps, races at a steady 30 fps (the
+     title's rate);
+   - three background → foreground round trips without losing the device;
+   - A15 keeps dynamic vertex strides;
+   - no Metal or MoltenVK errors.
+- Log retrieval: `devicectl device copy from ... Documents/nfsu2x_log.txt` sometimes times out (error 60)
+  while the file is growing; retrying works.
+
+**Open (Phase 2 material):**
+- touch controls (the owner has a DualSense; pair it with the phone);
+- a game-file import UI (today: Finder or `devicectl` into `Documents/game`);
+- FFmpeg VP6 for iOS (the lifted decoder suffices on A15);
+- background pause of audio and the guest (only GPU work is gated today);
+- thermal and long-session testing;
+- a performance profile (Instruments);
+- the pre-existing semaphore-reuse validation warning;
+- the native-override FMA drift.
