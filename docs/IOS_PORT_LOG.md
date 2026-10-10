@@ -297,3 +297,156 @@ Darwin's ABI and libc, and 16 KB pages.
   - `[fps] 42–52 fps`, vblank 59.8–60.0 Hz. No crash.
   - Frame dumps (`RECOMP_GL_DUMP`, 1/s) show the EA Games logo, the NFSU2 key art and the trailer, all
     rendered correctly.
+
+### Step 5: intro movie → main menu: **reached**
+
+- Pad script (times from the first pad read):
+  `RECOMP_PAD_SCRIPT="40000:start:300,50000:start:300,58000:a:200,66000:a:200"`.
+  1. Start at 40 s skips `FMVOpening`.
+  2. Start at 50 s leaves "Please press START to begin" (title, soundtrack credit, EA © line, all
+     rendered correctly); the title then scans `UDATA\4541005a`.
+  3. "Xbox hard disk: Would you like to create a new profile?" appears with **No** selected; A at 58 s
+     picks No.
+  4. **Main Menu**: NFSU2 logo, "Quick Race" carousel, the 3D menu car, "No Profile", Y Help.
+  5. A at 66 s opens "Quick Race Mode Select / Circuit".
+  All of this is checked from `RECOMP_GL_DUMP` frames (BMP → PNG with `sips`).
+- `[fps]` 57–60 fps in the menus, vblank 59.6–60.0 Hz; movies 42–52 fps through the lifted VP6 decoder.
+- No crash in any run after the host fix. The only `.ips` report (15:10:50) is the AppKit abort from
+  Step 4. So the predicted 512 KB default-stack overflow on guest/ISR/DPC threads **did not show up** on
+  the way to the menu, and per the "confirm before fixing" rule `CreateThread` is unchanged. Races
+  (deeper call chains) remain the case to watch.
+- `RECOMP_NATIVE_CHECK=1` (runs each native override against the lifted code) to the menu:
+  - 0 mismatches: `sub_000113A0`, `sub_0004B940`, `sub_0004BC20`, `sub_002EEA80`, `sub_0025ECB4`
+    (YUV rows, 524k rows).
+  - Mismatches: `sub_002213EA` (SSE 4×4 multiply, one of the two functions carrying GCC's ignored
+    `optimize("fp-contract=off")`), 20 reported; and `sub_0004B260` (sine of a 16-bit angle, x87
+    result), 683 of 4096 calls.
+  - This confirms the audit item: under Apple clang the native overrides are no longer bit-exact with the
+    lifted code. Last-bit drift, not crashes. Fix in Phase 1: build `recomp_manual.c` (and probably
+    `gen/`) with `-ffp-contract=off` under clang, then re-run the check. For `sub_0004B260`, also compare
+    Apple libm's `sin` with glibc's before blaming contraction.
+
+## Status at the end of Phase 0 (2026-10-10)
+
+**Done on arm64 macOS (M1, macOS 27.0.1):**
+- XBE lifted by `tools/regen.sh` (181 s).
+- Toolkit runtime tests pass.
+- Game built with Apple clang (≈2 min).
+- Boot → EA / THX / PSA / FMVOpening movies → title → profile prompt → **Main Menu** → Quick Race mode
+  select, on the **OpenGL** renderer (Apple GL 4.1 on Metal), with CoreAudio sound, at ~60 fps in the
+  menus.
+
+**Changes to shared upstream files (all small and guarded, or verbatim restorations):**
+- `win32_compat.c`: no thread affinity on Darwin.
+- `nv2a_vk.c`: portability enumeration/subset on Apple.
+- `nv2a_gl.c`: no off-main event drain on Apple.
+- `src/main.c`: `nfsu2_game_main()` on Apple.
+- `CMakeLists.txt`: Apple host source.
+- `tools/regen.sh`: generates the analysis JSON.
+- `xboxrecomp/tools/{disasm,func_id,recomp}/output.py`: restored from upstream.
+
+New file: `src/apple/apple_main.c`.
+
+**Blocking / open:**
+1. **Vulkan on Apple:** MoltenVK 1.4.2 has no `VK_EXT_vertex_input_dynamic_state`, which `nv2a_vk.c`
+   requires. This blocks Phase 1 as written ("the existing Vulkan renderer on MoltenVK").
+2. Native overrides drift under clang FP contraction (above).
+3. Not done: the FFmpeg VP6 build for macOS (the lifted decoder is fast enough on M1), any race,
+   controller input (only the scripted pad was used), `RECOMP_GL_THREAD`.
+4. Upstream hygiene: the extended-VMA reservation is not released by `xbox_MemoryLayoutShutdown`.
+   `tools/build_ffmpeg_vp6.sh` uses `nproc` (absent on macOS).
+
+## Phase 1 plan: iOS boot (intro movie + main menu on an iPhone)
+
+### Order of work (validate each step on macOS first, where possible)
+
+1. **Renderer (macOS first, ask gate: >20 lines in `nv2a_vk.c`).** Give `nv2a_vk` a static vertex-input
+   path for drivers without `VK_EXT_vertex_input_dynamic_state`:
+   - put the vertex binding/attribute layout (formats, offsets, present mask; strides too unless
+     `VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE` is used) into the pipeline key;
+   - build `VkPipelineVertexInputStateCreateInfo` per pipeline;
+   - keep `vkCmdSetVertexInputEXT` where the extension exists (Switch/NVK, Linux);
+   - extend `vkpipes.bin` so the prewarm covers the new variants.
+   Done when the macOS Vulkan build reaches the main menu on MoltenVK with `RECOMP_VK_VALIDATION=1`
+   clean (validation layers are installed). Also needed: window adoption, surface creation on the main
+   thread, and no off-main `SDL_PollEvent` — the same treatment `nv2a_gl` got.
+   - *Alternative if this proves large:* start Phase 3 (native Metal back end) early. It needs no SPIR-V
+     or MoltenVK, but it is the bigger job; the decision belongs to the owner.
+2. **Dependencies for iOS arm64** (`tools/build_ios_deps.sh`, new):
+   - SDL2 2.32 static from source;
+   - MoltenVK.xcframework (LunarG SDK or a `make ios` build; Homebrew's is macOS-only);
+   - glslang + SPIRV-Tools static;
+   - FFmpeg VP6 LGPL as a **dynamic** framework (`build_ffmpeg_vp6.sh ios` target, also fixing `nproc`).
+3. **iOS host** (new files):
+   - `src/apple/apple_main.c`, shared, gains an iOS branch: SDL's `SDL_main`, a full-screen window,
+     the 16 MB game thread (iOS's main-thread stack is 1 MB and secondary threads get 512 KB).
+   - `src/ios/ios_host.m` (thin Objective-C):
+     - resolve `Documents/` and `Library/Caches/`;
+     - `chdir(Caches)` so `xbox_kernel.log`, `progcache.bin` and `vk*.bin` land somewhere writable;
+     - read `Documents/nfsu2x_env.txt` (`KEY=VALUE`, port of `switch_nx.c`'s reader) into `setenv`;
+     - redirect stdout/stderr to `Documents/nfsu2x_log.txt`;
+     - set `NFSU2_GAME_DIR=Documents/game` and pass the save dir `Documents/save` (no XDG fallback).
+   - `src/ios/ios_lifecycle.c`: on `SDL_APP_WILLENTERBACKGROUND`, take the GIL from the host thread,
+     pause the SDL audio device and stop the executor before its next submit; reverse on foreground.
+4. **Platform layer for iOS** (`xboxrecomp/src/platform/ios_vm.c`, new; small `#if TARGET_OS_IOS` hooks
+   in `win32_compat.c`):
+   - `<mach/mach_vm.h>` is `#error unsupported` in the iOS 27.1 SDK, so use `vm_map` / `vm_allocate`
+     / `vm_deallocate` from `<mach/vm_map.h>` (64-bit `vm_address_t` on arm64) for fixed placement.
+   - `CreateFileMapping` is backed by `mach_make_memory_entry_64(MAP_MEM_NAMED_CREATE)` and views by
+     `vm_map(..., entry, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE)` inside our own reservation, instead of
+     `shm_open`, which the sandbox may refuse.
+   - `prot_from_page` drops `PROT_EXEC` on iOS (no JIT; guest `PAGE_EXECUTE*` reaches `mprotect` via
+     `kernel_memory.c`).
+   - Guest thread priorities map to QoS: the APU/audio thread is user-interactive and above game threads.
+5. **CMake for iOS** (`-G Xcode -DCMAKE_SYSTEM_NAME=iOS`, `ios/` for Info.plist and entitlements):
+   - `d3d8_null.c` instead of `d3d8_gl.c` (no libepoxy), no OpenSSL, no `nv2a_gl`;
+   - MoltenVK framework instead of the loader;
+   - `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace` so the disc can be copied into
+     `Documents/game` with the Files app or Finder;
+   - entitlements `com.apple.developer.kernel.increased-memory-limit` and
+     `com.apple.developer.kernel.extended-virtual-addressing`.
+
+### Memory-mapping strategy
+
+- **Keep upstream's base + offset model.** Every lifted access is already
+  `(uint32_t)va + g_xbox_mem_offset`; no new translation macro is needed, and there are no fixed low
+  addresses (macOS already runs it with the base at `0x7000000000`).
+- iOS needs about **4 GB of virtual address space** from that base (RAM + 28 mirrors 1.81 GB,
+  extended VMA 0.19 GB, apertures up to +0xFF100000), but only about 150 MB+ of it is ever dirty.
+  - Reserve the whole 4 GB window with **one** `vm_allocate(VM_FLAGS_ANYWHERE)` first, so every aperture
+    is carved out of our own reservation instead of racing other mappings (today only base + mirrors are
+    reserved together).
+  - Then map views with `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`.
+- If iOS refuses a 4 GB reservation without `extended-virtual-addressing` (or the personal team cannot
+  get that entitlement), shrink the footprint:
+  - measure on macOS whether NFSU2 ever touches the 64 MB RAM mirrors (`xbox_ProtectMirrorsForDebug`
+    makes them read-only and a write faults);
+  - if it doesn't, map no mirrors on iOS (−1.8 GB) and keep only the contiguous window and the apertures.
+- Dirty-memory budget: 64 MB RAM, ≤64 MB contiguous, ~25 MB apertures, renderer textures (keep the
+  texture budget conservative), host heap. Use `increased-memory-limit` and log `os_proc_available_memory()`
+  at boot.
+
+### Risks expected on device
+
+1. **VA limit / entitlements:** the 4 GB reservation may fail without extended virtual addressing;
+   a free personal team may not be allowed that entitlement or increased-memory-limit (7-day
+   provisioning as well).
+2. **Sandbox memory APIs:** `shm_open` blocked; `VM_FLAGS_FIXED` maps refused in some ranges. Test with a
+   tiny iOS probe app before porting the whole game.
+3. **Renderer:** the static-vertex-input path multiplies pipeline variants, so expect first-use hitches
+   (Metal pipeline compiles; prewarm from `vkpipes.bin`). Other MoltenVK limits to watch:
+   - Metal always has primitive restart on, so index `0xFFFF` in a 65,536-vertex strip batch would
+     restart;
+   - no D24S8 (the renderer already falls back to D32S8);
+   - BC textures may be unsupported on some iPhone GPUs (CPU decode fallback exists).
+4. **Threads:** a 1 MB main thread and 512 KB default thread stacks; deeper race call chains may overflow
+   where the menus did not. Thermal throttling on long runs.
+5. **Lifecycle:** any GPU submission in the background gets the app killed, so pause must stop the
+   executor, not just the guest.
+6. **Performance:** Darwin TLS accessor cost for the `__thread` register file, lifted code at `-O1`,
+   Darwin `setjmp` saving the signal mask. Upstream's Switch measurements (TLS, GIL handover, executor
+   cost per draw) are the guide; profile with Instruments.
+7. **Toolchain / legal:** every dependency rebuilt for iOS arm64. FFmpeg must stay a dynamic LGPL
+   library. The APU and `nv2a_regs.h` are LGPL-2.1 code linked statically into the app, which needs
+   object files or a dynamic library for relinking before any distribution.
+8. **Files:** iOS APFS is case-sensitive; `fix_case` already handles the disc's mixed-case names.
