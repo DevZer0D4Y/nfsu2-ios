@@ -281,6 +281,13 @@ int main(int argc, char **argv)
     switch_shutdown();
     return rc;
 }
+#elif defined(__APPLE__)
+/* AppKit/UIKit own the main thread: src/apple/apple_main.c has main() and
+ * runs the title on a thread of its own, as on the Switch. */
+int nfsu2_game_main(void)
+{
+    return game_main();
+}
 #else
 int main(int argc, char **argv)
 {
