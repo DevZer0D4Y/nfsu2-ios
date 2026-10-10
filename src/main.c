@@ -416,6 +416,13 @@ static int game_main(void)
         if (!gl || strcmp(gl, "0") != 0) {
 #if defined(NFSU2_VULKAN)
             extern void nv2a_vk_install(void);
+#if defined(NFSU2_METAL)
+            extern int nfsu2_apple_metal(void);         /* src/apple/apple_main.c */
+            extern void nv2a_mtl_install(void);
+            if (nfsu2_apple_metal())
+                nv2a_mtl_install();
+            else
+#endif
             nv2a_vk_install();
 #else
             extern void nv2a_gl_install(void);

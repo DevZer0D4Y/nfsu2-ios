@@ -293,6 +293,20 @@ int main(int argc, char **argv)
             fprintf(stderr, "no Metal device\n");
             return 1;
         }
+        {
+            /* The renderer's own copy and clear shaders. */
+            NSError *err = nil;
+            id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:nv2a_msl_fixed()]
+                                                     options:nil error:&err];
+            if (!lib || ![lib newFunctionWithName:@"copy_vs"] || ![lib newFunctionWithName:@"copy_fs"]
+             || ![lib newFunctionWithName:@"clear_vs"] || ![lib newFunctionWithName:@"clear_fs"]) {
+                fprintf(stderr, "FAIL fixed shaders: %s\n", err ? err.localizedDescription.UTF8String
+                                                               : "a function is missing");
+                s_fail++;
+            } else {
+                printf("fixed shaders: copy and clear compile\n");
+            }
+        }
         orientation(MTLWindingClockwise, 1);
         orientation(MTLWindingCounterClockwise, 0);
         fuzz(200);

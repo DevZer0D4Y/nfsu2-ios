@@ -12,6 +12,10 @@
  * The main thread must not block anywhere but SDL_WaitEvent: SDL's Cocoa GL
  * backend dispatch_sync()s [NSOpenGLContext update]/setView from the render
  * thread to the main queue, which only runs while the main loop does.
+ *
+ * With NFSU2_METAL built in, NFSU2_RENDERER=metal picks the native Metal
+ * renderer (nv2a_metal) over Vulkan/MoltenVK; its view and layer are made
+ * here on the main thread as the Vulkan surface is.
  */
 #if defined(__APPLE__)
 
@@ -19,6 +23,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <TargetConditionals.h>
@@ -39,6 +44,13 @@ static SDL_Window   *s_win;
 static SDL_GLContext s_ctx;
 static int           s_rc = 1;
 static Uint32        s_done_event;
+static int           s_metal;            /* NFSU2_RENDERER=metal */
+
+/* src/main.c: which renderer to install. */
+int nfsu2_apple_metal(void)
+{
+    return s_metal;
+}
 
 #if !defined(NFSU2_VULKAN)
 /* nv2a_gl.c: a weak default returns 0 and the renderer would create its own
@@ -90,6 +102,40 @@ int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
     if (!r.ok)
         fprintf(stderr, "[apple] Vulkan surface: %s\n", SDL_GetError());
     return r.ok ? 1 : 0;
+}
+#endif
+
+#if defined(NFSU2_METAL)
+#include <SDL_metal.h>
+
+/* nv2a_metal.m: the window's CAMetalLayer, from a Metal view SDL adds on the
+ * main thread (as for the Vulkan surface). */
+static void *s_layer;
+
+static void make_layer(void *arg)
+{
+    SDL_MetalView view;
+    (void)arg;
+    view = SDL_Metal_CreateView(s_win);
+    if (view)
+        s_layer = SDL_Metal_GetLayer(view);
+#if TARGET_OS_IPHONE
+    if (s_layer)
+        ios_touch_attach(s_win);        /* above the Metal view SDL just added */
+#endif
+}
+
+void *nv2a_mtl_host_layer(void)
+{
+    if (!s_win)
+        return NULL;
+    if (pthread_main_np())
+        make_layer(NULL);
+    else
+        dispatch_sync_f(dispatch_get_main_queue(), NULL, make_layer);
+    if (!s_layer)
+        fprintf(stderr, "[apple] Metal view: %s\n", SDL_GetError());
+    return s_layer;
 }
 #endif
 
@@ -155,6 +201,13 @@ void nv2a_vk_host_gate(void)
         pthread_cond_wait(&s_fg_cond, &s_fg_lock);
     pthread_mutex_unlock(&s_fg_lock);
 }
+
+#if defined(NFSU2_METAL)
+void nv2a_mtl_host_gate(void)
+{
+    nv2a_vk_host_gate();
+}
+#endif
 #endif
 
 static void *game_thread(void *arg)
@@ -193,6 +246,18 @@ int main(int argc, char **argv)
     if (getenv("NFSU2_GAME_DIR"))       /* the user's disc, picked in the app if missing */
         ios_import_game(getenv("NFSU2_GAME_DIR"));
 #endif
+#if defined(NFSU2_METAL)
+    {
+        const char *r = getenv("NFSU2_RENDERER");
+        if (r && !strcmp(r, "metal")) {
+            if (__builtin_available(macOS 14.0, iOS 17.0, *))
+                s_metal = 1;
+            else
+                fprintf(stderr, "[apple] the Metal renderer needs macOS 14 / iOS 17\n");
+        }
+        fprintf(stderr, "[apple] renderer: %s\n", s_metal ? "Metal" : "Vulkan (MoltenVK)");
+    }
+#endif
 #if !defined(NFSU2_VULKAN)
     /* The attributes nv2a_gl.c asks for when it makes the window itself. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -213,13 +278,17 @@ int main(int argc, char **argv)
         const char *h = getenv("RECOMP_VK_HEADLESS");
         if (!(h && *h == '1')) {
 #if TARGET_OS_IPHONE
-            s_win = SDL_CreateWindow("NFSU2", 0, 0, 0, 0, SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN |
-                                     SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS);
+            s_win = SDL_CreateWindow("NFSU2", 0, 0, 0, 0,
+                                     (s_metal ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) |
+                                     SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI |
+                                     SDL_WINDOW_BORDERLESS);
             if (s_win)
                 ios_attach_window_to_scene(s_win);
 #else
-            s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                     1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+            s_win = SDL_CreateWindow(s_metal ? "NV2A (Metal)" : "NV2A (Vulkan)",
+                                     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
+                                     (s_metal ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) |
+                                     SDL_WINDOW_RESIZABLE);
 #endif
             if (!s_win)
                 fprintf(stderr, "[apple] Vulkan window: %s\n", SDL_GetError());

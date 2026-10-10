@@ -50,6 +50,14 @@ int nv2a_msl_vertex(const uint32_t (*prog)[4], uint32_t slots, uint32_t start,
  * overflow or a generator error. */
 int nv2a_msl_fragment(const Nv2aPshKey *k, char *buf, size_t cap);
 
+/* The renderer's own shaders, one library:
+ *   copy_vs / copy_fs    a textured quad over the viewport: float4 uv rect
+ *                        (u0, v0, u1, v1) in vertex buffer 0, texture and
+ *                        sampler 0; a 4-vertex triangle strip
+ *   clear_vs / clear_fs  a quad over the viewport at depth z (float, vertex
+ *                        buffer 0) in colour c (float4, fragment buffer 0) */
+const char *nv2a_msl_fixed(void);
+
 /* Nonzero: texture stage i of k samples a cube map (texturecube). */
 int nv2a_msl_stage_is_cube(const Nv2aPshKey *k, int i);
 
