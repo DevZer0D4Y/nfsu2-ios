@@ -209,3 +209,21 @@ Darwin's ABI and libc, and 16 KB pages.
   - Side finding: `xbox_MemoryLayoutShutdown` does not release the extended-VMA reservation, so the
     second init logs `Extended VMA: FAILED ... (error 8)`. Harmless for a title that initialises once.
 - `kernel_memory_posix`: passes.
+
+### Step 2: lift the XBE (`tools/regen.sh`): **blocked, not by macOS**
+
+- `PATH=xboxrecomp/.venv/bin:$PATH NFSU2_XBE=~/nfsu2/game/default.xbe NFSU2_GEN_DIR=$PWD/gen tools/regen.sh`
+  stops immediately: `ModuleNotFoundError: No module named 'tools.disasm.output'`.
+- Cause: the vendored toolkit is missing three of its own modules, imported by `tools/disasm/disasm.py:20`,
+  `tools/func_id/identify.py:20`, `tools/recomp/__main__.py:29` (and `tools/test_doctor.py:161`):
+  `xboxrecomp/tools/{disasm,func_id,recomp}/output.py`. They are not ignored by any `.gitignore` here and
+  appear nowhere in this repo's history, so they were dropped when upstream vendored the toolkit. Upstream
+  regenerates from a separate full checkout (`/root/nfsu2x/xboxrecomp-pr128`, see UPSTREAM_NOTES "Layout
+  and builds"), which is why this never showed up there. It breaks regen on every OS.
+- Candidate fix: restore the three files verbatim from the toolkit's origin, `sp00nznet/xboxrecomp` main
+  @ `193e2995ffae` (2026-10-07, MIT). That is 292 + 212 + 113 lines, stdlib only. Their exported names
+  and signatures match every call site in the vendored tree (`OutputWriter(...)`/`write_all`,
+  `print_stats`, `write_results`, `write_summary`, `generate_header`). Copies for review are in the
+  session scratchpad, not in the repo.
+  **Not applied:** it brings external code into the shared upstream tree, so it waits for the owner's decision.
+- No macOS-specific regen issue found so far (the pipeline is pure Python, no subprocess or GNU tools).
