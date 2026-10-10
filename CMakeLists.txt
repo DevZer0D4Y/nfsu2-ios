@@ -34,6 +34,14 @@ endif()
 # links mesa-switch's static NVK (NVK_SDK) and builds nfsu2x-vulkan.nro.
 option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
 set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
+# Apple: the native Metal renderer too, chosen at run time with
+# NFSU2_RENDERER=metal (src/apple/apple_main.c); Vulkan stays the fallback.
+if(APPLE AND NFSU2_VULKAN)
+    option(NFSU2_METAL "Also build the Metal renderer" ON)
+else()
+    set(NFSU2_METAL OFF)
+endif()
+set(XBOXRECOMP_METAL ${NFSU2_METAL} CACHE BOOL "" FORCE)
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
@@ -101,6 +109,9 @@ endif()
 
 if(NFSU2_VULKAN)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_VULKAN=1)
+endif()
+if(NFSU2_METAL)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_METAL=1)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE

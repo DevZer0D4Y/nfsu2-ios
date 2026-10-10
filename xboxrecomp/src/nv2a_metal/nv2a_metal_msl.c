@@ -200,6 +200,36 @@ int nv2a_msl_vertex(const uint32_t (*prog)[4], uint32_t slots, uint32_t start,
     return o.overflow ? -1 : (int)(cap - o.left);
 }
 
+const char *nv2a_msl_fixed(void)
+{
+    return
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct QOut { float4 pos [[position]]; float2 uv; };\n"
+        "static float4 quad_pos(uint vid) {\n"
+        "    float2 p = float2((vid & 1) ? 1.0 : 0.0, (vid & 2) ? 1.0 : 0.0);\n"
+        "    return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+        "}\n"
+        "vertex QOut copy_vs(uint vid [[vertex_id]], constant float4& r [[buffer(0)]]) {\n"
+        "    QOut o;\n"
+        "    o.pos = quad_pos(vid);\n"
+        "    o.uv = mix(r.xy, r.zw, float2((vid & 1) ? 1.0 : 0.0, (vid & 2) ? 1.0 : 0.0));\n"
+        "    return o;\n"
+        "}\n"
+        "fragment float4 copy_fs(QOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+        "                        sampler s [[sampler(0)]]) {\n"
+        "    return t.sample(s, in.uv);\n"
+        "}\n"
+        "struct COut { float4 pos [[position]]; };\n"
+        "vertex COut clear_vs(uint vid [[vertex_id]], constant float& z [[buffer(0)]]) {\n"
+        "    COut o;\n"
+        "    o.pos = quad_pos(vid);\n"
+        "    o.pos.z = z;\n"
+        "    return o;\n"
+        "}\n"
+        "fragment float4 clear_fs(constant float4& c [[buffer(0)]]) { return c; }\n";
+}
+
 int nv2a_msl_stage_is_cube(const Nv2aPshKey *k, int i)
 {
     return ((k->shader_program >> (5 * i)) & 0x1F) == 3;

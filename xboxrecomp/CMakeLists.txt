@@ -38,6 +38,7 @@ add_subdirectory(src/kernel)
 add_subdirectory(src/d3d)
 
 option(XBOXRECOMP_VULKAN "Build the Vulkan renderer (nv2a_vk) instead of OpenGL" OFF)
+option(XBOXRECOMP_METAL "Also build the Metal renderer (nv2a_metal, Apple only)" OFF)
 
 # The Vulkan build on the Switch links mesa-switch's NVK. switch-sdl2 brings
 # switch-mesa's EGL/GL, a second copy of Mesa's utilities: strip them from
@@ -83,6 +84,9 @@ if(NOT WIN32)
         add_subdirectory(src/nv2a_gl)
     endif()
 endif()
+if(APPLE AND XBOXRECOMP_METAL)
+    add_subdirectory(src/nv2a_metal)
+endif()
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -104,5 +108,8 @@ if(NOT WIN32)
     else()
         target_link_libraries(xboxrecomp INTERFACE xbox_nv2a_gl)
     endif()
+endif()
+if(APPLE AND XBOXRECOMP_METAL)
+    target_link_libraries(xboxrecomp INTERFACE xbox_nv2a_metal)
 endif()
 
