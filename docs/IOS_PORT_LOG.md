@@ -524,3 +524,28 @@ Owner approved the >20-line change to `nv2a_vk.c`.
   mostly other apps plus a low-clocked GPU.
 - MoltenVK also reports `samplerMipLodBias = false` (any LOD bias the title sets is ignored) and
   `pointPolygons = false`.
+
+## 2026-10-10 — Phase 1 (iOS boot): started, **not yet built**
+
+- Targets available: Simulator runtimes iOS 27.0/27.1 (iPhone 18 Pro); paired device iPhone 13 Pro
+  (iPhone14,2, A15, 6 GB); signing identity "Apple Development" (account type not yet confirmed).
+- `tools/build_ios_deps.sh sim` (committed) built SDL2 2.32.10 static, glslang 16.6.0 (no optimizer) and
+  MoltenVK 1.4.2 (official static library; simulator slice taken from `MoltenVK-all.tar`) into
+  `~/nfsu2/deps/sim` in 52 s. The device target is not built yet.
+- Written, **not compiled yet** (stopped on disk space: 1.3 GiB free, 1.7 GB swap):
+  - `win32_compat.c`: on `TARGET_OS_IPHONE`, `vm_map` instead of the unsupported `<mach/mach_vm.h>`,
+    and no `PROT_EXEC` in guest protections. `shm_open` is kept until a device run shows whether the
+    sandbox allows it.
+  - CMake: iOS → `d3d8_null.c` (no libepoxy), no OpenSSL; `nv2a_vk` links MoltenVK statically with
+    its frameworks; the root makes an app bundle (`ios/Info.plist.in`: Files-app sharing, landscape)
+    and links `SDL2main`.
+  - `src/ios/ios_host.c`: `Documents/game` (`NFSU2_GAME_DIR`), `Documents/nfsu2x_env.txt`,
+    `Documents/nfsu2x_log.txt`, saves in `Library/Application Support`, cwd `Library/Caches`.
+  - `apple_main.c`: iOS full-screen Vulkan window, landscape hint, `ios_host_setup()`.
+- **Next:**
+  1. Free disk.
+  2. Configure:
+     `cmake -S . -B build-ios-sim -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DCMAKE_PREFIX_PATH=$HOME/nfsu2/deps/sim -DNFSU2_GEN_DIR=$PWD/gen -DNFSU2_VULKAN=ON`
+  3. Build, then `xcrun simctl install` / `launch` with `SIMCTL_CHILD_NFSU2_GAME_DIR=$HOME/nfsu2/game`.
+  4. Then the device build (signing, entitlements), the lifecycle pause, and the memory-reservation
+     check on the A15.

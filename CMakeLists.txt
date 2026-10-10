@@ -62,6 +62,22 @@ if(APPLE)
     target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c)
 endif()
 
+# iOS app: SDL's UIKit glue runs apple_main.c's main as SDL_main; Vulkan via
+# MoltenVK; dependencies from tools/build_ios_deps.sh on CMAKE_PREFIX_PATH.
+if(IOS)
+    set(NFSU2_IOS_BUNDLE_ID "com.example.nfsu2x" CACHE STRING "iOS bundle identifier")
+    find_package(SDL2 REQUIRED)
+    target_sources(${PROJECT_NAME} PRIVATE src/ios/ios_host.c)
+    target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2main)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${NFSU2_IOS_BUNDLE_ID}"
+        MACOSX_BUNDLE_BUNDLE_NAME "NFSU2"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1")
+endif()
+
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
 # (src/movie_vp6.c). NFSU2_FFMPEG_DIR is an install of the minimal LGPL
 # build from tools/build_ffmpeg_vp6.sh (libavcodec with only the vp6

@@ -26,6 +26,16 @@ if(NINTENDO_SWITCH)
     target_link_libraries(xbox_nv2a_vk PUBLIC
         "${NVK_SDK}/lib/libvulkan.a" expat z nx
         "${NVK_SDK}/lib/libvulkan.a" expat z nx stdc++ m)
+elseif(IOS)
+    # MoltenVK linked statically (no loader on iOS) and glslang without its
+    # optimizer, both from tools/build_ios_deps.sh (on CMAKE_PREFIX_PATH).
+    find_package(SDL2 REQUIRED)
+    find_library(MOLTENVK_LIB MoltenVK REQUIRED)
+    find_path(MOLTENVK_INCLUDE vulkan/vulkan.h REQUIRED)
+    target_include_directories(xbox_nv2a_vk PUBLIC "${MOLTENVK_INCLUDE}")
+    target_link_libraries(xbox_nv2a_vk PUBLIC "${MOLTENVK_LIB}" SDL2::SDL2 c++
+        "-framework Metal" "-framework QuartzCore" "-framework IOSurface"
+        "-framework UIKit" "-framework Foundation" "-framework CoreGraphics")
 else()
     find_package(Vulkan REQUIRED)
     find_package(PkgConfig REQUIRED)
