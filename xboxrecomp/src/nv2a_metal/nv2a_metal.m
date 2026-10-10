@@ -16,7 +16,8 @@
  *              of compiled functions across runs).
  *   pipelines  keyed by the program, blend state, colour mask, whether there
  *              is a depth buffer, points, and the 16 vertex formats; vertex
- *              strides are dynamic (MTLBufferLayoutStrideDynamic). Depth and
+ *              strides are dynamic (MTLBufferLayoutStrideDynamic) where the
+ *              GPU has them (Apple4+), else in the key too. Depth and
  *              stencil are cached MTLDepthStencilStates; cull, winding,
  *              scissor, stencil reference and blend colour are encoder state.
  *   clears     quads (Metal has no mid-pass clear of a rectangle).
@@ -79,6 +80,9 @@ static CAMetalLayer       *s_layer;
 static int                 s_headless;
 static int                 s_have_bc;
 static uint32_t            s_max_size = 8192;
+/* No dynamic vertex strides (the iOS Simulator's GPU): strides go into the
+ * pipeline key. */
+static int                 s_static_stride;
 
 __attribute__((weak)) void *nv2a_mtl_host_layer(void)
 {
@@ -1259,6 +1263,7 @@ typedef struct {
     int      prog;
     uint32_t blend, bsrc, bdst, beq, cmask, depth, points;
     uint32_t vfmt[NV2A_RAW_ATTRS];
+    uint32_t vstride[NV2A_RAW_ATTRS];   /* s_static_stride only, else 0 */
 } PipeKey;
 
 typedef struct {
@@ -1339,8 +1344,8 @@ static void pipe_rec_append(const PipeKey *k)
     char path[256];
     PipeRec rec;
     FILE *f;
-    if (s_prewarming || !cache_path(path, sizeof path, "mtlpipes.bin"))
-        return;
+    if (s_prewarming || s_static_stride || !cache_path(path, sizeof path, "mtlpipes.bin"))
+        return;                             /* static strides: not recorded */
     memset(&rec, 0, sizeof rec);
     rec.magic = PIPE_REC_MAGIC;
     rec.vkey = s_prog[k->prog].vkey;
@@ -1391,7 +1396,7 @@ static id<MTLRenderPipelineState> pipe_get(const PipeKey *k)
             vd.layouts[i].stride = 16;
         } else {
             vd.layouts[i].stepFunction = MTLVertexStepFunctionPerVertex;
-            vd.layouts[i].stride = MTLBufferLayoutStrideDynamic;
+            vd.layouts[i].stride = s_static_stride ? k->vstride[i] : MTLBufferLayoutStrideDynamic;
         }
     }
     d.vertexDescriptor = vd;
@@ -1600,6 +1605,9 @@ static int ready(void)
 #pragma clang diagnostic pop
     }
     s_max_size = [s_dev supportsFamily:MTLGPUFamilyApple3] ? 16384 : 8192;
+    /* Apple4+ (every Apple-silicon Mac and A11+ device; the builds are
+     * arm64 only). */
+    s_static_stride = ![s_dev supportsFamily:MTLGPUFamilyApple4];
     s_have_bc = s_dev.supportsBCTextureCompression;
     {
         const char *e = getenv("RECOMP_GL_DXT");
@@ -1651,8 +1659,9 @@ static int ready(void)
         }
     }
     s_state = 1;
-    fprintf(stderr, "  [MTL] ready%s: BC %s, surfaces up to %u\n", s_headless ? " (headless)" : "",
-            s_have_bc ? "yes" : "no", s_max_size);
+    fprintf(stderr, "  [MTL] ready%s: BC %s, surfaces up to %u, vertex strides %s\n",
+            s_headless ? " (headless)" : "", s_have_bc ? "yes" : "no", s_max_size,
+            s_static_stride ? "in the pipelines" : "dynamic");
     prewarm();
     return 1;
 }
@@ -1965,6 +1974,23 @@ static void attr_to_float4(const Nv2aRawBatch *b, uint32_t a, uint32_t v, float 
     }
 }
 
+/* The stride each attribute gets in upload_vertices (s_static_stride): the
+ * title's own for attributes uploaded as stored, the packed float4 block for
+ * converted ones, 16 for absent ones (constant step: unused). */
+static void vertex_strides_key(const Nv2aRawBatch *b, uint32_t *vstride)
+{
+    uint32_t a, np = 0, direct = 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_direct & (1u << a)) && vertex_format(b, a) != MTLVertexFormatInvalid)
+            direct |= 1u << a;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_present & ~direct) & (1u << a))
+            np++;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        vstride[a] = (direct & (1u << a)) ? b->direct[a].stride
+                   : (b->attr_present & (1u << a)) ? np * 16 : 16;
+}
+
 /* The format each attribute gets in upload_vertices: the title's own for
  * attributes uploaded as stored, float4 for converted ones, a float4
  * constant for absent ones. */
@@ -2053,8 +2079,11 @@ static int upload_vertices(const Nv2aRawBatch *b)
             offs[a] = at + const_at + a * 16;
         }
     }
-    [s_enc setVertexBuffers:bufs offsets:offs attributeStrides:strides
-                  withRange:NSMakeRange(0, NV2A_RAW_ATTRS)];
+    if (s_static_stride)
+        [s_enc setVertexBuffers:bufs offsets:offs withRange:NSMakeRange(0, NV2A_RAW_ATTRS)];
+    else
+        [s_enc setVertexBuffers:bufs offsets:offs attributeStrides:strides
+                      withRange:NSMakeRange(0, NV2A_RAW_ATTRS)];
     return 1;
 }
 
@@ -2321,6 +2350,8 @@ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
     key.depth = d != NULL;
     key.points = cls == 0;
     vertex_formats_key(b, key.vfmt);
+    if (s_static_stride)
+        vertex_strides_key(b, key.vstride);
     pipe = pipe_get(&key);
     if (!pipe)
         return;
