@@ -67,7 +67,9 @@ endif()
 if(IOS)
     set(NFSU2_IOS_BUNDLE_ID "com.example.nfsu2x" CACHE STRING "iOS bundle identifier")
     find_package(SDL2 REQUIRED)
-    target_sources(${PROJECT_NAME} PRIVATE src/ios/ios_host.c)
+    enable_language(OBJC)
+    target_sources(${PROJECT_NAME} PRIVATE src/ios/ios_host.c src/ios/ios_scene.m)
+    set_source_files_properties(src/ios/ios_scene.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2main)
     set_target_properties(${PROJECT_NAME} PROPERTIES
         MACOSX_BUNDLE TRUE
