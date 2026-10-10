@@ -677,3 +677,27 @@ Device runs:
 - FFmpeg VP6 for iOS (an LGPL dylib, per CLAUDE.md; the lifted decoder is enough on the A15 today);
 - thermal, long-session testing and an Instruments profile;
 - the semaphore-reuse validation warning; the native-override FMA drift.
+
+## 2026-10-10 — Phase 3 plan: native Metal renderer (`nv2a_metal`)
+
+Owner asked to start Phase 3 (Phase 2 device tests of touch and background pause still pending).
+
+**Shape:** a third back end beside `nv2a_gl`/`nv2a_vk`, registered with the executor exactly like
+`nv2a_vk` (`draw_raw`, `NV2A_BACKEND_RAW_DIRECT`), ported from `nv2a_vk.c` (same surface/depth/texture
+caches, render scale, cube maps from surfaces, instancing, program cache). New files only:
+- `xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c` (plain C): MSL source for a program. It reuses the
+  shared generators unchanged: the vertex program body from `nv2a_gl_vsh_program()` and the combiner
+  body from `nv2a_gl_psh()` in their Vulkan dialect, wrapped in an MSL prelude (GLSL names as MSL
+  typedefs/macros; the vertex body runs as a member function of a struct holding the register file).
+  Clip space differs from Vulkan only in y (Metal NDC y is up).
+- `xboxrecomp/src/nv2a_metal/nv2a_metal.m` (Objective-C, ARC): one `MTLDevice`, queue and
+  `CAMetalLayer`; 3 frames in flight, each with its own ring buffer; render passes per surface,
+  clears as quads, pipelines keyed on program + blend + colour mask + depth + vertex formats
+  (strides dynamic, `MTLBufferLayoutStrideDynamic`, iOS 17 / macOS 14), depth-stencil states cached.
+- `xboxrecomp/tests/nv2a_metal_msl/`: compiles the MSL of every program in a `progcache.bin`
+  with the Metal compiler (no game data in the repo; the file comes from a run).
+- Host: `apple_main.c` makes a Metal view/layer on the main thread when `NFSU2_RENDERER=metal`;
+  small guarded hooks in `src/main.c` and CMake. MoltenVK stays the default until Metal matches it.
+
+**Order:** MSL + offline test → back end on macOS (main menu, race; frame dumps against Vulkan) →
+iOS Simulator → device (owner) → caches/perf (binary archive, instancing) → default switch.
