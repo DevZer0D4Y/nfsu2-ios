@@ -53,6 +53,9 @@
 #define mach_vm_address_t vm_address_t
 #define mach_vm_size_t    vm_size_t
 #define mach_vm_map       vm_map
+int   ios_mapping_create(size_t size);                          /* ios_vm.c */
+void *ios_mapping_view(int port, void *base, size_t len, uint64_t off, int writable);
+void  ios_mapping_close(int port);
 #else
 #include <mach/mach_vm.h>
 #endif
@@ -462,7 +465,11 @@ static void obj_release(w32_object *o)
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        if (o->fd >= 0) ios_mapping_close(o->fd);
+#else
         if (o->fd >= 0) close(o->fd);
+#endif
     } else if (o->kind == K_WAITABLE_TIMER) {
         /* Waitable timers: no special cleanup needed */
     }
@@ -2440,9 +2447,17 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* The app sandbox refuses shm_open: a Mach memory entry (ios_vm.c). */
+    int fd = ios_mapping_create(size);
+    (void)name;
+    if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (0) {
+#else
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
+#endif
         close(fd);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
@@ -2495,7 +2510,12 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
 #endif
     }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    void *p = ios_mapping_view(o->fd, baseAddr, len, (uint64_t)off, (prot & PROT_WRITE) != 0);
+    (void)flags;
+#else
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
+#endif
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of

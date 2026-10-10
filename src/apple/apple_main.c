@@ -86,6 +86,38 @@ int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
 }
 #endif
 
+#if TARGET_OS_IPHONE
+/* iOS kills an app that submits GPU work from the background (the device
+ * is lost: kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
+ * SDL reports the transitions on the main thread; the renderer's gate holds
+ * its next acquire/submit until the app is in front again. The guest then
+ * stalls behind its own pushbuffer, which is the pause. */
+static pthread_mutex_t s_fg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_fg_cond = PTHREAD_COND_INITIALIZER;
+static int             s_background;
+
+static int app_events(void *userdata, SDL_Event *e)
+{
+    (void)userdata;
+    if (e->type == SDL_APP_WILLENTERBACKGROUND || e->type == SDL_APP_DIDENTERFOREGROUND) {
+        pthread_mutex_lock(&s_fg_lock);
+        s_background = e->type == SDL_APP_WILLENTERBACKGROUND;
+        pthread_cond_broadcast(&s_fg_cond);
+        pthread_mutex_unlock(&s_fg_lock);
+        fprintf(stderr, "[ios] %s\n", s_background ? "background: GPU work paused" : "foreground");
+    }
+    return 1;
+}
+
+void nv2a_vk_host_gate(void)
+{
+    pthread_mutex_lock(&s_fg_lock);
+    while (s_background)
+        pthread_cond_wait(&s_fg_cond, &s_fg_lock);
+    pthread_mutex_unlock(&s_fg_lock);
+}
+#endif
+
 static void *game_thread(void *arg)
 {
     SDL_Event e;
@@ -108,6 +140,7 @@ int main(int argc, char **argv)
 #if TARGET_OS_IPHONE
     ios_host_setup();                   /* paths, settings file, log */
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_IDLE_TIMER_DISABLED, "1");   /* no auto-lock during movies */
 #endif
     /* Controllers too: macOS delivers their arrival and input through the
      * main run loop, which only this thread pumps. */
@@ -115,6 +148,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[apple] SDL video: %s\n", SDL_GetError());
         return 1;
     }
+#if TARGET_OS_IPHONE
+    SDL_AddEventWatch(app_events, NULL);
+#endif
 #if !defined(NFSU2_VULKAN)
     /* The attributes nv2a_gl.c asks for when it makes the window itself. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
