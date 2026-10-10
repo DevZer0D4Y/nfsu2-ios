@@ -56,6 +56,12 @@ endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+# AppKit owns the main thread: window and events there, the title on its own
+# thread (src/apple/apple_main.c).
+if(APPLE)
+    target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c)
+endif()
+
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
 # (src/movie_vp6.c). NFSU2_FFMPEG_DIR is an install of the minimal LGPL
 # build from tools/build_ffmpeg_vp6.sh (libavcodec with only the vp6

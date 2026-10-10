@@ -270,3 +270,30 @@ Darwin's ABI and libc, and 16 KB pages.
   `VK_EXT_vertex_input_dynamic_state`**, and MoltenVK's own user guide does not list it either.
   `nv2a_vk.c` requests it at device creation and calls `vkCmdSetVertexInputEXT` for every draw.
   **Vulkan is blocked on Apple until nv2a_vk has a static vertex-input path. Switching to OpenGL.**
+
+### Step 4: OpenGL renderer: macOS host owns the main thread
+
+- `build-macos` (GL, default options): all of `gen/` plus the runtime build in **127 s** (`-j6`, M1), 25 MB binary.
+- Unmodified run: `NSInternalInconsistencyException: 'API misuse: setting the main menu on a non-main
+  thread'`, then abort. The stack is `nv2a_ack_thread → nv2a_pb_scan → clear_surface → gl_clear → ready →
+  SDL_InitSubSystem(SDL_INIT_VIDEO) → Cocoa_RegisterApp → -[NSApplication setMainMenu:]`. The renderer
+  initialises SDL video lazily on the pushbuffer-executor thread, which Linux/X11 tolerates and AppKit does
+  not (window creation and event pumping are main-thread-only too).
+- **Fix** (the Switch's own pattern):
+  - New `src/apple/apple_main.c` owns `main()`. It calls `SDL_Init(VIDEO)`, creates the 1280×720 GL
+    3.3-core window and context on the main thread, releases the context and hands it to the renderer
+    through the existing weak hook `nv2a_gl_adopt_window()`.
+  - It runs the title (`nfsu2_game_main()`) on a 16 MB pthread and pumps events on the main thread with
+    `SDL_WaitEvent`. SDL's Cocoa GL backend `dispatch_sync`s `NSOpenGLContext update` from the render
+    thread to the main queue, so the main thread blocks nowhere else.
+  - `src/main.c` exposes `nfsu2_game_main()` instead of `main()` on Apple (`#elif defined(__APPLE__)`).
+  - `nv2a_gl.c` skips its per-present `SDL_PollEvent` drain on Apple, since AppKit events must not be
+    pumped off-main.
+  - Root `CMakeLists.txt` adds the file `if(APPLE)`.
+- **Result (75 s run):**
+  - `[GL] Apple / Apple M1 / 4.1 Metal - 91.7`, `[AUDIO] SDL coreaudio output: 48000 Hz, 2 ch`.
+  - Movies play in order, `MOVIES\ealogo.vp6` → `THX_LOGO` → `PSA` → `FMVOpening`, through the
+    **lifted** VP6 decoder (no FFmpeg build).
+  - `[fps] 42–52 fps`, vblank 59.8–60.0 Hz. No crash.
+  - Frame dumps (`RECOMP_GL_DUMP`, 1/s) show the EA Games logo, the NFSU2 key art and the trailer, all
+    rendered correctly.

@@ -2131,10 +2131,12 @@ swap:
     SDL_GL_SwapWindow(s_win);
     gl_step_done("swap");
     tex_bind_forget();
+#if !defined(__APPLE__)        /* AppKit events are pumped by the host's main thread */
     {
         SDL_Event e;
         while (SDL_PollEvent(&e)) { }
     }
+#endif
 }
 
 /* ── Threaded submission (RECOMP_GL_THREAD=1) ─────────────────────────
