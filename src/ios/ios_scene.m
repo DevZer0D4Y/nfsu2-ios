@@ -12,11 +12,25 @@
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include <stdio.h>
+#include "ios_scene.h"
+
+UIWindowScene *ios_window_scene(void)
+{
+    /* On a device the scene connects a moment after launch (the simulator
+     * has it at once): let the main run loop turn until it is there. */
+    for (int tries = 0; tries < 200; tries++) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
+            if ([s isKindOfClass:[UIWindowScene class]])
+                return (UIWindowScene *)s;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+    }
+    return nil;
+}
 
 int ios_attach_window_to_scene(SDL_Window *window)
 {
     SDL_SysWMinfo info;
-    UIWindowScene *scene = nil;
+    UIWindowScene *scene;
     UIWindow *uiwin;
 
     SDL_VERSION(&info.version);
@@ -25,17 +39,7 @@ int ios_attach_window_to_scene(SDL_Window *window)
         return 0;
     }
     uiwin = info.info.uikit.window;
-    /* On a device the scene connects a moment after launch (the simulator
-     * has it at once): let the main run loop turn until it is there. */
-    for (int tries = 0; !scene && tries < 200; tries++) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
-            if ([s isKindOfClass:[UIWindowScene class]]) {
-                scene = (UIWindowScene *)s;
-                break;
-            }
-        if (!scene)
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
-    }
+    scene = ios_window_scene();
     if (!scene) {
         fprintf(stderr, "[ios] no connected window scene\n");
         return 0;
