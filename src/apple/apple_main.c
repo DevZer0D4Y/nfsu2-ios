@@ -21,6 +21,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#if !defined(NFSU2_VULKAN)
+#error "iOS renders with Vulkan (MoltenVK): configure with -DNFSU2_VULKAN=ON"
+#endif
+void ios_host_setup(void);              /* src/ios/ios_host.c */
+#endif
+
 int nfsu2_game_main(void);              /* main.c */
 
 static SDL_Window   *s_win;
@@ -96,6 +104,10 @@ int main(int argc, char **argv)
 
     (void)argc;
     (void)argv;
+#if TARGET_OS_IPHONE
+    ios_host_setup();                   /* paths, settings file, log */
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
     /* Controllers too: macOS delivers their arrival and input through the
      * main run loop, which only this thread pumps. */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
@@ -121,8 +133,13 @@ int main(int argc, char **argv)
     {
         const char *h = getenv("RECOMP_VK_HEADLESS");
         if (!(h && *h == '1')) {
+#if TARGET_OS_IPHONE
+            s_win = SDL_CreateWindow("NFSU2", 0, 0, 0, 0, SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN |
+                                     SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS);
+#else
             s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+#endif
             if (!s_win)
                 fprintf(stderr, "[apple] Vulkan window: %s\n", SDL_GetError());
         }

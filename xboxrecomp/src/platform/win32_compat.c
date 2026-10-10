@@ -42,10 +42,20 @@
 #include <sys/mman.h>
 #endif
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#if TARGET_OS_IPHONE
+/* <mach/mach_vm.h> is #error on iOS; vm_map takes the same arguments and is
+ * 64-bit on arm64. */
+#include <mach/vm_map.h>
+#define mach_vm_address_t vm_address_t
+#define mach_vm_size_t    vm_size_t
+#define mach_vm_map       vm_map
+#else
 #include <mach/mach_vm.h>
+#endif
 #elif !defined(__SWITCH__)
 #include <sys/sysinfo.h>
 #endif
@@ -1743,6 +1753,12 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
 #else
 static int prot_from_page(DWORD protect)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* No JIT on iOS: anonymous memory cannot be executable, and no guest code
+     * ever runs from it (it is all recompiled). Keep the read/write half. */
+    if (protect & 0xF0)
+        protect = (protect & 0xC0) ? PAGE_READWRITE : PAGE_READONLY;
+#endif
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
