@@ -27,6 +27,7 @@
 #error "iOS renders with Vulkan (MoltenVK): configure with -DNFSU2_VULKAN=ON"
 #endif
 void ios_host_setup(void);              /* src/ios/ios_host.c */
+int ios_attach_window_to_scene(SDL_Window *window);   /* src/ios/ios_scene.m */
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
@@ -136,6 +137,8 @@ int main(int argc, char **argv)
 #if TARGET_OS_IPHONE
             s_win = SDL_CreateWindow("NFSU2", 0, 0, 0, 0, SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN |
                                      SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS);
+            if (s_win)
+                ios_attach_window_to_scene(s_win);
 #else
             s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);

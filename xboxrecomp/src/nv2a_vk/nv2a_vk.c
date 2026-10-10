@@ -113,6 +113,10 @@ static PFN_vkCmdSetStencilOp          p_stencil_op;
  * part of the pipeline key and only the strides stay dynamic (core 1.3). */
 static int                            s_static_vi;
 static PFN_vkCmdBindVertexBuffers2    p_bind_vb2;
+/* ...and where even dynamic strides are refused (MoltenVK on the iOS
+ * simulator GPU), the strides go into the key too. Set at the first
+ * pipeline that fails with VK_ERROR_FEATURE_NOT_PRESENT. */
+static int                            s_static_stride;
 /* Portability drivers (MoltenVK): Metal has no fans, and the emulation does
  * not follow a fan set as dynamic topology -- they drew as strips. */
 static int                            s_fan_lists;
@@ -1560,6 +1564,7 @@ typedef struct {
     int      prog;
     uint32_t blend, bsrc, bdst, beq, cmask, depth, topo;
     uint32_t vfmt[NV2A_RAW_ATTRS];      /* s_static_vi only, else 0 */
+    uint32_t vstride[NV2A_RAW_ATTRS];   /* s_static_stride only, else 0 */
 } PipeKey;
 
 typedef struct {
@@ -1649,8 +1654,8 @@ static void pipe_rec_append(const PipeKey *k)
     char path[256];
     PipeRec rec;
     FILE *f;
-    if (s_prewarming || !cache_path(path, sizeof path, pipes_file()))
-        return;
+    if (s_prewarming || s_static_stride || !cache_path(path, sizeof path, pipes_file()))
+        return;                             /* static strides: not recorded */
     memset(&rec, 0, sizeof rec);
     rec.magic = PIPE_REC_MAGIC;
     rec.vkey = s_prog[k->prog].vkey;
@@ -1738,7 +1743,7 @@ static VkPipeline pipe_get(const PipeKey *k)
         dyns[sizeof dyn / sizeof dyn[0] - 1] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         for (i = 0; i < NV2A_RAW_ATTRS; i++) {
             vb[i].binding = i;
-            vb[i].stride = 0;
+            vb[i].stride = k->vstride[i];         /* 0 and ignored unless s_static_stride */
             vb[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
             va[i].location = i;
             va[i].binding = i;
@@ -1750,7 +1755,7 @@ static VkPipeline pipe_get(const PipeKey *k)
         vi.vertexAttributeDescriptionCount = NV2A_RAW_ATTRS;
         vi.pVertexAttributeDescriptions = va;
     }
-    dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]);
+    dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]) - (s_static_stride ? 1u : 0u);
     dy.pDynamicStates = dyns;
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &cfmt;
@@ -1772,9 +1777,17 @@ static VkPipeline pipe_get(const PipeKey *k)
     ci.layout = s_layout;
     VT("vkCreateGraphicsPipelines prog %d blend %u cmask %X depth %u topo %u\n", k->prog, k->blend,
        k->cmask, k->depth, k->topo);
-    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &pipe) != VK_SUCCESS) {
-        LOGE("pipeline creation failed\n");
-        return VK_NULL_HANDLE;
+    {
+        VkResult pr = vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &pipe);
+        if (pr == VK_ERROR_FEATURE_NOT_PRESENT && s_static_vi && !s_static_stride) {
+            s_static_stride = 1;
+            LOGE("dynamic vertex strides refused: strides go into the pipelines from now on\n");
+            return VK_NULL_HANDLE;
+        }
+        if (pr != VK_SUCCESS) {
+            LOGE("pipeline creation failed (%d)\n", (int)pr);
+            return VK_NULL_HANDLE;
+        }
     }
     if (s_npipes == VK_MAX_PIPE) {
         LOGE("pipeline table full\n");
@@ -2636,6 +2649,24 @@ static void vertex_formats_key(const Nv2aRawBatch *b, uint32_t *vfmt)
     }
 }
 
+/* The stride each binding gets in upload_vertices (s_static_stride): the
+ * title's own for attributes uploaded as stored, the packed float4 block for
+ * converted ones, 0 for absent ones (their constant). */
+static void vertex_strides_key(const Nv2aRawBatch *b, uint32_t *vstride)
+{
+    uint32_t a, np = 0, direct = 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_direct & (1u << a))
+                && vertex_format(b->direct[a].type, b->direct[a].size) != VK_FORMAT_UNDEFINED)
+            direct |= 1u << a;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_present & ~direct) & (1u << a))
+            np++;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        vstride[a] = (direct & (1u << a)) ? b->direct[a].stride
+                   : (b->attr_present & (1u << a)) ? np * 16 : 0;
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -2723,7 +2754,10 @@ static int upload_vertices(const Nv2aRawBatch *b)
             offs[a] = at + const_at + a * 16;
         }
     }
-    if (s_static_vi) {
+    if (s_static_stride) {
+        /* Formats and strides are both in the pipeline. */
+        vkCmdBindVertexBuffers(s_cb, 0, NV2A_RAW_ATTRS, bufs, offs);
+    } else if (s_static_vi) {
         /* The formats are in the pipeline (vertex_formats_key). */
         VkDeviceSize strides[NV2A_RAW_ATTRS];
         for (a = 0; a < NV2A_RAW_ATTRS; a++)
@@ -3031,6 +3065,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     key.topo = cls;
     if (s_static_vi)
         vertex_formats_key(b, key.vfmt);
+    if (s_static_stride)
+        vertex_strides_key(b, key.vstride);
     pipe = pipe_get(&key);
     if (!pipe)
         return;

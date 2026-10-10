@@ -549,3 +549,26 @@ Owner approved the >20-line change to `nv2a_vk.c`.
   3. Build, then `xcrun simctl install` / `launch` with `SIMCTL_CHILD_NFSU2_GAME_DIR=$HOME/nfsu2/game`.
   4. Then the device build (signing, entitlements), the lifecycle pause, and the memory-reservation
      check on the A15.
+
+## 2026-10-10 — iOS Simulator: boots to the main menu
+
+- Free disk 2.1 GiB after cleanup. `build-ios-sim` (Ninja, `CMAKE_SYSTEM_NAME=iOS`,
+  `iphonesimulator`, arm64, deps from `~/nfsu2/deps/sim`) **compiled and linked first time** in 77 s:
+  all of `gen/`, the runtime, MoltenVK and SDL2. App bundle 34 MB, ad-hoc signed.
+- Launch 1: SIGTRAP in `_UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption` (lldb attached to
+  `simctl launch --wait-for-debugger`). **Apps built with the iOS 27 SDK must adopt the UIScene
+  lifecycle**; SDL2 2.32 still makes its UIWindow the old way. Fix: `Info.plist` declares one scene
+  configuration (no delegate class), and `src/ios/ios_scene.m` (thin Objective-C, ARC) attaches SDL's
+  `UIWindow` to the connected `UIWindowScene` right after `SDL_CreateWindow`.
+- Launch 2: the guest boots and the Vulkan device comes up (2622×1206 swapchain), but every pipeline
+  fails. MoltenVK: `VK_ERROR_FEATURE_NOT_PRESENT: ... does not support
+  VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE (macOS 14.0 or iOS/tvOS 17.0, plus either Apple4 or Mac2
+  GPU)`; the simulator GPU is not Apple4-class. Fix (`nv2a_vk.c`): at the first such failure, switch
+  once to `s_static_stride`. The strides join the formats in the pipeline key (`vertex_strides_key`, the
+  same rule `upload_vertices` uses) and bind with `vkCmdBindVertexBuffers`. These pipelines are not
+  recorded for prewarm. A real A15 (Apple8, iOS 27) should keep dynamic strides.
+- Launch 3 (`SIMCTL_CHILD_NFSU2_GAME_DIR=$HOME/nfsu2/game`, pad script): **ealogo → THX → PSA →
+  FMVOpening → title → "PROFILE has been loaded successfully." → Main Menu**, 52–60 fps, vblank 59.9 Hz,
+  0 pipeline failures. Checked from `simctl io screenshot`.
+- Gotcha: `simctl launch --stdout/--stderr` into a file that an earlier, still-running instance writes to
+  gives misleading logs; terminate first and use fresh file names.
