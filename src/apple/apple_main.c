@@ -30,6 +30,7 @@ void ios_host_setup(void);              /* src/ios/ios_host.c */
 int ios_attach_window_to_scene(SDL_Window *window);   /* src/ios/ios_scene.m */
 void ios_touch_attach(SDL_Window *window);            /* src/ios/ios_touch.m */
 void ios_touch_controllers_changed(void);
+int ios_import_game(const char *game_dir);            /* src/ios/ios_import.m */
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
@@ -189,6 +190,8 @@ int main(int argc, char **argv)
     }
 #if TARGET_OS_IPHONE
     SDL_AddEventWatch(app_events, NULL);
+    if (getenv("NFSU2_GAME_DIR"))       /* the user's disc, picked in the app if missing */
+        ios_import_game(getenv("NFSU2_GAME_DIR"));
 #endif
 #if !defined(NFSU2_VULKAN)
     /* The attributes nv2a_gl.c asks for when it makes the window itself. */
