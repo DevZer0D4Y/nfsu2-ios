@@ -187,3 +187,25 @@ Darwin's ABI and libc, and 16 KB pages.
 | `tools/build_ffmpeg_vp6.sh` | Uses `nproc` (GNU coreutils); only `switch`/`linux` targets, needs `macos`/`ios` (LGPL dylib) |
 
 ---
+
+## 2026-10-10 — Phase 0: macOS bring-up
+
+### Step 1: runtime without game files (`xboxrecomp/tests/*_posix`)
+
+- Build failed in exactly one place: `xbox_guest_pin()` uses glibc's `cpu_set_t` / `CPU_SET` /
+  `pthread_setaffinity_np` (`win32_compat.c`), which Darwin lacks. This is an NFSU2-port addition
+  (`RECOMP_GUEST_ONE_CORE`); the rest of the toolkit's Apple paths compiled.
+  **Fix:** `#elif defined(__APPLE__)` in `xbox_guest_core()` logs that the switch is ignored and keeps
+  core = -1; `xbox_guest_pin()` compiles the affinity block only `#elif !defined(__APPLE__)`. Darwin
+  has no hard thread affinity, and the switch is a diagnostic.
+- After that the whole runtime (kernel, APU, NV2A, USB, input, GL renderer, d3d8_gl + epoxy) builds with
+  Apple clang: 0 errors, 71 warnings.
+- `memory_layout_posix_test` (synthetic `test.xbe`): **0 failures**.
+  - Base `0x7000000000` (offset +0x7000000000). Host page 16384; base and size are page-aligned.
+  - All 28 mirrors alias in both directions.
+  - Contiguous `0x80000000`, NV2A `0xFD000000`, MCPX `0xFE800000`, flash `0xFF000000` and tiled
+    `0xF0000000` all map, including on re-init. The tiled ↔ contiguous alias is verified.
+  - `RECOMP_TRAP_NULL` faults on guest 0 with the TIB at `0x4000` intact.
+  - Side finding: `xbox_MemoryLayoutShutdown` does not release the extended-VMA reservation, so the
+    second init logs `Extended VMA: FAILED ... (error 8)`. Harmless for a title that initialises once.
+- `kernel_memory_posix`: passes.

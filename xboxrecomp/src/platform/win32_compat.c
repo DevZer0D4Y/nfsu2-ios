@@ -857,6 +857,8 @@ int xbox_guest_core(void)
             if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)))
                 for (int c = 2; c >= 0; c--)
                     if ((mask >> c) & 1u) { core = c; break; }
+#elif defined(__APPLE__)
+            fprintf(stderr, "  [THREAD] RECOMP_GUEST_ONE_CORE ignored: Darwin has no thread affinity\n");
 #else
             long n = sysconf(_SC_NPROCESSORS_ONLN);
             core = n > 1 ? (int)n - 1 : -1;
@@ -882,7 +884,7 @@ void xbox_guest_pin(int interrupt)
      * interrupt thread goes above it so it pre-empts guest threads. */
     if (interrupt)
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
-#else
+#elif !defined(__APPLE__)          /* glibc only; Darwin returns above (core -1) */
     {
         cpu_set_t set;
         CPU_ZERO(&set);
