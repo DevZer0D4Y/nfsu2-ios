@@ -701,3 +701,49 @@ caches, render scale, cube maps from surfaces, instancing, program cache). New f
 
 **Order:** MSL + offline test → back end on macOS (main menu, race; frame dumps against Vulkan) →
 iOS Simulator → device (owner) → caches/perf (binary archive, instancing) → default switch.
+
+## 2026-10-10 — Phase 3: native Metal renderer runs on macOS, the Simulator and the iPhone
+
+Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static-stride fallback).
+
+- **Shaders** (`nv2a_metal_msl.c`): gl_vsh.c / gl_psh.c Vulkan-dialect output reused unchanged, wrapped
+  in MSL (typedefs and macros for the GLSL names; the vertex body as a member function of a struct
+  holding the register file; fragment header replaced, `return fragColor;` appended; clip y negated).
+  - Gotcha: a `#define texture(t, uv)` macro also expanded inside `[[texture(n)]]` attributes; the
+    macros are now defined after the function header.
+  - `xboxrecomp/tests/nv2a_metal_msl` (macOS): 200 random vertex programs + combiner states, every
+    record of a `progcache.bin`, the renderer's copy/clear shaders, and a rendered triangle that pins
+    orientation (pixel (0,0) top left) and winding (clockwise front kept, counter-clockwise culled).
+    `build-macos-tests-mtl/nv2a_metal_msl_test build-macos-vk/run/progcache.bin` → 463 pairs,
+    0 failures. Metal's own shader cache made the second run 3.7 s instead of 56 s.
+- **Back end** (`nv2a_metal.m`, ARC): ported from nv2a_vk.c (surfaces, depth per zeta address and size,
+  texture cache, render scale, cube maps from surfaces, instancing, progcache.bin prewarm +
+  `mtlpipes.bin`). Metal-specific: clears are quads (no mid-pass clear), presents and cube faces are
+  textured quads (blits do not scale), a draw sampling its own target reads a copy, front-and-back
+  culled triangles are skipped (no such cull mode), S32K attributes are converted on the CPU (Metal has
+  no scaled formats), the border wrap mode is `ClampToZero` (= transparent black border).
+  Dynamic vertex strides need an Apple4+ GPU; the iOS Simulator's GPU is not, so strides go into the
+  pipeline key there (same as nv2a_vk's `s_static_stride`).
+- **Host:** `NFSU2_RENDERER=metal` (env / `nfsu2x_env.txt`) picks it; `apple_main.c` makes the window
+  with `SDL_WINDOW_METAL` and the view/layer on the main thread, the background gate is shared with
+  Vulkan. Default stays Vulkan (MoltenVK). Shared edits: `src/main.c` +7 lines, CMake +18 lines.
+- **macOS (M1)**, Metal API validation on (`MTL_DEBUG_LAYER=1`): movies, title, profile load, main menu,
+  Quick Race mode select with the 3D car and reflections, 58 fps; no validation errors. A Quick Race:
+  world, lighting, colour grade, HUD, minimap all correct, 30 fps (the title's rate), ~2300 draws →
+  ~1370 draw calls (~900 instances appended). First-use compiles ~100 ms per program under validation.
+- **iOS Simulator** (iPhone 18 Pro, "Apple iOS simulator GPU"): strides in the pipelines, BC no;
+  boots to the Quick Race menu at 59.9 fps; `simctl io screenshot` shows the presented frame correct.
+- **iPhone 13 Pro (A15)**: `[MTL] ready: BC no, surfaces up to 16384, vertex strides dynamic`,
+  prewarm 70 programs in 2.8 s; menus 59.6–59.9 fps; open-world driving 30.0 fps steady with ~850 draws
+  → ~600 draw calls; a frame dump shows rain, lights, car and minimap rendered correctly.
+- The same device run on MoltenVK for comparison was cut short: the app went to the background
+  (screen locked), and the log shows the Phase 2 background pause working on the device:
+  `[ios] background: GPU work, guest and audio paused`, then `[ios] guest paused`.
+- Regression: macOS Vulkan default still reaches the menu (57–58 fps); macOS GL and iOS device builds OK.
+
+**Open:**
+- Metal vs MoltenVK on the device: CPU time per frame and GPU time (Instruments / `RECOMP_FPS_LOG`
+  in a heavier scene), thermals over a long session; then decide whether Metal becomes the default.
+- Pipeline compile hitches on first use: async prewarm and/or an `MTLBinaryArchive`.
+- Partial-mask colour clears (logged, as in nv2a_vk); point sprites use size 1.
+- Device test of the touch controls (Phase 2) still pending.
