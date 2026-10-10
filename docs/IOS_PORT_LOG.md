@@ -450,3 +450,20 @@ New file: `src/apple/apple_main.c`.
    library. The APU and `nv2a_regs.h` are LGPL-2.1 code linked statically into the app, which needs
    object files or a dynamic library for relinking before any distribution.
 8. **Files:** iOS APFS is case-sensitive; `fix_case` already handles the disc's mixed-case names.
+
+## 2026-10-10 — Phase 0 follow-up: real controller input
+
+- Owner report: the game starts, but the gamepad (DualSense over Bluetooth) does nothing, so the first
+  movie cannot be skipped.
+- Cause (code): on POSIX nothing calls `xbox_InputInit()` (`xinput_device.c`), the only place that starts
+  SDL's game-controller subsystem and opens pads. So `xbox_InputGetState()` always answered
+  `ERROR_DEVICE_NOT_CONNECTED` (Linux included; upstream drove menus with `RECOMP_PAD_SCRIPT`, and the
+  Switch has its own path). Also: keyboard input (`RECOMP_KEYBOARD`) exists only on Windows, and
+  `xbox_FramebufferKeyDown` is a stub elsewhere (`fb_present.c:368`).
+- **Fix:**
+  - `apple_main.c` starts `SDL_INIT_GAMECONTROLLER` on the main thread with video. macOS delivers
+    controller arrival and input through the main run loop that thread pumps.
+  - `xbox_InputGetState()` rescans when a port has no attached pad, at most once a second per port.
+    This also covers late discovery and reconnects. It logs `[INPUT] port N: <name>`.
+- Verified: `[INPUT] port 0: DualSense Wireless Controller`, `InputGetState=0` once a second
+  (`RECOMP_INPUT_DIAG=1`). Button presses still need checking by hand.
