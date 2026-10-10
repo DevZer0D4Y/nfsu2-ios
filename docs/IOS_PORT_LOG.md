@@ -227,3 +227,16 @@ Darwin's ABI and libc, and 16 KB pages.
   session scratchpad, not in the repo.
   **Not applied:** it brings external code into the shared upstream tree, so it waits for the owner's decision.
 - No macOS-specific regen issue found so far (the pipeline is pure Python, no subprocess or GNU tools).
+- **Resolved (owner approved):** the three modules were restored verbatim (commit "xboxrecomp: restore
+  missing ...").
+- Second blocker: `tools.disasm` needs the XBE parser's `<stem>_analysis.json` and looks for it next to
+  the XBE. `regen.sh` never produced it; upstream evidently had one lying beside its XBE. **Fix:**
+  `regen.sh` now runs `tools.xbe_parser --json` into the ignored `xboxrecomp/tools/disasm/output/` and
+  passes `--analysis-json`, so nothing is written into the game directory. Not macOS-specific.
+- **Result:** regen succeeds on macOS in **181 s** (M1, Python 3.13, capstone 5.0.7):
+  - 19,539 functions loaded, 19,536 translated, 0 failed;
+  - 2,494,663 lines of C in 79 files (`gen/`, 130 MB), plus ≈140 MB of tool output, all ignored;
+  - 3 functions excluded for `recomp_manual.c`, 22 wrapped as `sub_X_gen`;
+  - 670 functions with MMIO accessors (DSOUND, XPP);
+  - 159 unresolved call targets stubbed; 3,501 `TODO:` sites (`RECOMP_UNIMPL`, reported at runtime).
+- No macOS-specific change was needed for the lift itself.

@@ -25,7 +25,13 @@ GEN="${NFSU2_GEN_DIR:-/root/nfsu2x/gen}"
 
 cd "$TK"
 if [ "${LIFT_ONLY:-0}" != "1" ]; then
-    python3 -m tools.disasm "$XBE" --seed-functions "$HERE/config/seed_functions.json"
+    # tools.disasm needs the XBE parser's section analysis. Written next to the
+    # disassembly output (gitignored) rather than into the game directory.
+    ANALYSIS="$TK/tools/disasm/output/$(basename "${XBE%.*}")_analysis.json"
+    mkdir -p "$(dirname "$ANALYSIS")"
+    python3 -m tools.xbe_parser "$XBE" --json "$ANALYSIS" --quiet
+    python3 -m tools.disasm "$XBE" --seed-functions "$HERE/config/seed_functions.json" \
+        --analysis-json "$ANALYSIS"
     python3 -m tools.func_id "$XBE"
     python3 -m tools.abi_analysis "$XBE"
 fi
