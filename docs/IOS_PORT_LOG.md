@@ -489,3 +489,38 @@ Sampled `ioreg` IOAccelerator "Device Utilization %" once a second, 2026-10-10:
   Vulkan-on-MoltenVK fallback (Phase 1) or the native Metal renderer (Phase 3) removes the GL translation
   layer.
 - For a precise breakdown: `sudo powermetrics --samplers gpu_power` (GPU frequency and active residency).
+
+## 2026-10-10 — Vulkan renderer on MoltenVK: working (main menu and a race)
+
+Owner approved the >20-line change to `nv2a_vk.c`.
+
+- **Static vertex input** when the device lacks `VK_EXT_vertex_input_dynamic_state` (MoltenVK):
+  - `s_static_vi` is detected at device creation; the extension and its feature struct are requested
+    only where offered.
+  - The 16 vertex formats are added to `PipeKey` (`vertex_formats_key()`, the same rule
+    `upload_vertices` uses: the title's format for attributes uploaded as stored, float4 otherwise).
+  - Pipelines get one binding per location. Strides stay dynamic (`VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE`
+    + `vkCmdBindVertexBuffers2`, core 1.3), which keeps the number of variants down.
+  - Prewarm records go to `vkpipes_sv.bin` (record + 16 formats), so `vkpipes.bin` keeps its format on
+    Switch/Linux. Devices that have the extension are unchanged.
+- **Fans → triangle lists** on portability drivers (`s_fan_lists`). NV2A `TRIANGLE_FAN`/`POLYGON` went out
+  as `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN` via dynamic topology. Metal has no fans, and MoltenVK's
+  emulation did not apply, so they drew as strips: every full-screen quad lost its second triangle (a
+  diagonal black half on title and movies) and glyph quads were garbled. Converted on the CPU like quads.
+  MoltenVK reports `vertexAttributeAccessBeyondStride = true` and stride alignment 1, which ruled out the
+  stride-0 constant attributes first.
+- **Window/surface on the main thread** (as for GL): weak hooks `nv2a_vk_adopt_window()` and
+  `nv2a_vk_host_surface()`. `apple_main.c` creates the `SDL_WINDOW_VULKAN` window and makes the surface
+  with `dispatch_sync_f` to the main queue. No off-main `SDL_PollEvent` on Apple.
+- **Result:**
+  - `[VK] swapchain 1280x720, 3 images`, prewarm from cache.
+  - Movies, title, loading screen (controller diagram text sharp), main menu, and a Quick Race (world,
+    HUD, minimap, tachometer) all render correctly.
+  - 58–60 fps in menus, 30 fps in the race (the title's own race rate).
+- Validation (`RECOMP_VK_VALIDATION=1`, Homebrew layers): only `VUID-vkQueueSubmit-pSignalSemaphores-00067`.
+  The "rendered" semaphore is per frame-in-flight (2), not per swapchain image (3). That is pre-existing
+  and platform-independent; logged as an upstream follow-up.
+- GPU (`ioreg`, quiet baseline 4–12%): GL main menu ≈22%, Vulkan main menu ≈25%. The earlier "100%" was
+  mostly other apps plus a low-clocked GPU.
+- MoltenVK also reports `samplerMipLodBias = false` (any LOD bias the title sets is ignored) and
+  `pointPolygons = false`.
