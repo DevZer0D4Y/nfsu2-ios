@@ -343,6 +343,15 @@ int xa2_queue_target(void)
     return g_sdla_target;
 }
 
+#if defined(__APPLE__)
+void xa2_pause(int on)
+{
+    if (!g_sdla_dev) return;
+    if (!on) SDL_ClearQueuedAudio(g_sdla_dev);
+    SDL_PauseAudioDevice(g_sdla_dev, on);
+}
+#endif
+
 /* RECOMP_AUDIO_DUMP=<path>,<start s>,<seconds>: the exact PCM handed to the
  * device (48 kHz s16 stereo, after volume and limiter), from <start> seconds
  * after the device opened, kept in RAM and written in one go when full -- a

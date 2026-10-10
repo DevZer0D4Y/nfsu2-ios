@@ -96,11 +96,41 @@ int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
 /* iOS kills an app that submits GPU work from the background (the device
  * is lost: kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
  * SDL reports the transitions on the main thread; the renderer's gate holds
- * its next acquire/submit until the app is in front again. The guest then
- * stalls behind its own pushbuffer, which is the pause. */
+ * its next acquire/submit until the app is in front again.
+ *
+ * The guest itself is paused too, and the sound: a thread of ours takes the
+ * guest lock (kernel_bridge.c) and keeps it while the app is away, so no
+ * guest thread runs -- the main thread must not wait for it itself -- and
+ * the audio device stops. Otherwise the APU kept looping the title's sound
+ * buffers, which nothing refilled, until iOS suspended the app. */
 static pthread_mutex_t s_fg_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_fg_cond = PTHREAD_COND_INITIALIZER;
 static int             s_background;
+
+void xbox_gil_enter(void);              /* kernel_bridge.c: the guest lock */
+void xbox_gil_leave(void);
+void xa2_pause(int on);                 /* apu_xaudio2.c */
+
+static void *pause_thread(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&s_fg_lock);
+    for (;;) {
+        while (!s_background)
+            pthread_cond_wait(&s_fg_cond, &s_fg_lock);
+        pthread_mutex_unlock(&s_fg_lock);
+        xbox_gil_enter();               /* each guest thread stops at its next yield */
+        pthread_mutex_lock(&s_fg_lock);
+        if (s_background)
+            fprintf(stderr, "[ios] guest paused\n");
+        while (s_background)
+            pthread_cond_wait(&s_fg_cond, &s_fg_lock);
+        pthread_mutex_unlock(&s_fg_lock);
+        xbox_gil_leave();
+        pthread_mutex_lock(&s_fg_lock);
+    }
+    return NULL;
+}
 
 static int app_events(void *userdata, SDL_Event *e)
 {
@@ -110,7 +140,9 @@ static int app_events(void *userdata, SDL_Event *e)
         s_background = e->type == SDL_APP_WILLENTERBACKGROUND;
         pthread_cond_broadcast(&s_fg_cond);
         pthread_mutex_unlock(&s_fg_lock);
-        fprintf(stderr, "[ios] %s\n", s_background ? "background: GPU work paused" : "foreground");
+        xa2_pause(e->type == SDL_APP_WILLENTERBACKGROUND);
+        fprintf(stderr, "[ios] %s\n", e->type == SDL_APP_WILLENTERBACKGROUND
+                ? "background: GPU work, guest and audio paused" : "foreground");
     }
     return 1;
 }
@@ -199,8 +231,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "[FATAL] cannot start the game thread\n");
         return 1;
     }
-    pthread_attr_destroy(&attr);
     pthread_detach(th);
+#if TARGET_OS_IPHONE
+    if (pthread_create(&th, NULL, pause_thread, NULL) == 0)
+        pthread_detach(th);
+#endif
+    pthread_attr_destroy(&attr);
 
     for (;;) {
         SDL_Event e;

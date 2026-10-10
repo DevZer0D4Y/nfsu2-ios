@@ -27,6 +27,12 @@ int xa2_queued(void);
 /* Blocks the APU frame thread keeps queued ahead of the device. */
 int xa2_queue_target(void);
 
+#if defined(__APPLE__) && !defined(_WIN32)
+/* SDL output only: stop the device (an iOS app going to the background) or
+ * start it again, dropping what queued meanwhile. */
+void xa2_pause(int on);
+#endif
+
 /* Output health since start, for a title's vitals monitor. An underrun is a
  * submit that found nothing queued (playback ran dry: an audible gap); a drop
  * is a rendered block discarded because the queue was full (a skip). Both are
