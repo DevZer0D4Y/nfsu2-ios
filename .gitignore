@@ -63,3 +63,17 @@ gen/
 
 # Per-game toolkit output (disassembly of the retail XBE)
 xboxrecomp/tools/*/output/
+
+# macOS/iOS bring-up: build dirs, renderer caches, run logs, game data
+build-*/
+*.log
+progcache.bin
+vkspirv.bin
+vkpipes.bin
+vkpipecache.bin
+prof.bin
+*.dump
+NFSUNDER/
+TDATA/
+UDATA/
+.venv/
