@@ -109,6 +109,13 @@ static PFN_vkCmdSetDepthWriteEnable   p_depth_write;
 static PFN_vkCmdSetDepthCompareOp     p_depth_op;
 static PFN_vkCmdSetStencilTestEnable  p_stencil_test;
 static PFN_vkCmdSetStencilOp          p_stencil_op;
+/* Without VK_EXT_vertex_input_dynamic_state (MoltenVK) the vertex formats are
+ * part of the pipeline key and only the strides stay dynamic (core 1.3). */
+static int                            s_static_vi;
+static PFN_vkCmdBindVertexBuffers2    p_bind_vb2;
+/* Portability drivers (MoltenVK): Metal has no fans, and the emulation does
+ * not follow a fan set as dynamic topology -- they drew as strips. */
+static int                            s_fan_lists;
 
 /* Presentation. */
 static VkSurfaceKHR   s_surface;
@@ -120,6 +127,22 @@ static VkImage        s_sc_images[8];
 static int            s_headless;
 #if !defined(__SWITCH__)
 static SDL_Window    *s_win;
+
+/* A host that has to make the window itself (AppKit and UIKit: main thread
+ * only) hands it over here, and makes the surface for it (its view, too, is
+ * main-thread only). The defaults leave both to this file. */
+__attribute__((weak)) int nv2a_vk_adopt_window(void **win)
+{
+    (void)win;
+    return 0;
+}
+
+__attribute__((weak)) int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
+{
+    (void)inst;
+    (void)surface;
+    return 0;
+}
 #endif
 
 static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -1536,6 +1559,7 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 typedef struct {
     int      prog;
     uint32_t blend, bsrc, bdst, beq, cmask, depth, topo;
+    uint32_t vfmt[NV2A_RAW_ATTRS];      /* s_static_vi only, else 0 */
 } PipeKey;
 
 typedef struct {
@@ -1613,12 +1637,19 @@ typedef struct {
 } PipeRec;
 static uint32_t s_pipes_unsaved;
 
+/* Static vertex layouts add the 16 formats after each record, in a file of
+ * their own so vkpipes.bin keeps its format. */
+static const char *pipes_file(void)
+{
+    return s_static_vi ? "vkpipes_sv.bin" : "vkpipes.bin";
+}
+
 static void pipe_rec_append(const PipeKey *k)
 {
     char path[256];
     PipeRec rec;
     FILE *f;
-    if (s_prewarming || !cache_path(path, sizeof path, "vkpipes.bin"))
+    if (s_prewarming || !cache_path(path, sizeof path, pipes_file()))
         return;
     memset(&rec, 0, sizeof rec);
     rec.magic = PIPE_REC_MAGIC;
@@ -1628,6 +1659,8 @@ static void pipe_rec_append(const PipeKey *k)
     rec.cmask = k->cmask; rec.depth = k->depth; rec.topo = k->topo;
     if ((f = fopen(path, "ab"))) {
         fwrite(&rec, sizeof rec, 1, f);
+        if (s_static_vi)
+            fwrite(k->vfmt, sizeof k->vfmt, 1, f);
         fclose(f);
     }
 }
@@ -1660,6 +1693,9 @@ static VkPipeline pipe_get(const PipeKey *k)
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     };
+    VkDynamicState dyns[sizeof dyn / sizeof dyn[0]];
+    VkVertexInputBindingDescription vb[NV2A_RAW_ATTRS];
+    VkVertexInputAttributeDescription va[NV2A_RAW_ATTRS];
     VkPipeline pipe = VK_NULL_HANDLE;
     VkProg *p = &s_prog[k->prog];
 
@@ -1695,8 +1731,27 @@ static VkPipeline pipe_get(const PipeKey *k)
     ba.colorWriteMask = k->cmask;
     cb.attachmentCount = 1;
     cb.pAttachments = &ba;
+    memcpy(dyns, dyn, sizeof dyn);
+    if (s_static_vi) {
+        /* One binding per location as upload_vertices binds them; strides
+         * come with vkCmdBindVertexBuffers2, offsets are the buffers'. */
+        dyns[sizeof dyn / sizeof dyn[0] - 1] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+        for (i = 0; i < NV2A_RAW_ATTRS; i++) {
+            vb[i].binding = i;
+            vb[i].stride = 0;
+            vb[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            va[i].location = i;
+            va[i].binding = i;
+            va[i].format = (VkFormat)k->vfmt[i];
+            va[i].offset = 0;
+        }
+        vi.vertexBindingDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexBindingDescriptions = vb;
+        vi.vertexAttributeDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexAttributeDescriptions = va;
+    }
     dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]);
-    dy.pDynamicStates = dyn;
+    dy.pDynamicStates = dyns;
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &cfmt;
     if (k->depth) {
@@ -1811,14 +1866,15 @@ static void prewarm(void)
         }
         fclose(f);
     }
-    if (cache_path(path, sizeof path, "vkpipes.bin") && (f = fopen(path, "rb"))) {
+    if (cache_path(path, sizeof path, pipes_file()) && (f = fopen(path, "rb"))) {
         while (fread(&pr, sizeof pr, 1, f) == 1) {
             VkProg *p;
             PipeKey k;
+            memset(&k, 0, sizeof k);
             if (pr.magic != PIPE_REC_MAGIC) { bad++; break; }
+            if (s_static_vi && fread(k.vfmt, sizeof k.vfmt, 1, f) != 1) { bad++; break; }
             if (!(p = prog_find(pr.vkey, &pr.pk)))
                 continue;
-            memset(&k, 0, sizeof k);
             k.prog = (int)(p - s_prog);
             k.blend = pr.blend; k.bsrc = pr.bsrc; k.bdst = pr.bdst; k.beq = pr.beq;
             k.cmask = pr.cmask; k.depth = pr.depth; k.topo = pr.topo;
@@ -1938,11 +1994,15 @@ static int ready(void)
         const char *drv = getenv("SDL_VIDEODRIVER");
         s_headless = (e && *e == '1') || (drv && !strcmp(drv, "offscreen"));
         if (!s_headless) {
-            if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+            if (nv2a_vk_adopt_window((void **)&s_win)) {
+                /* the host's window (AppKit: made on the main thread) */
+            } else if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
                 s_headless = 1;
             } else {
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                          1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+            }
+            if (!s_headless) {
                 if (!s_win) {
                     s_headless = 1;
                 } else {
@@ -2055,7 +2115,8 @@ static int ready(void)
         }
     }
 #else
-    if (!s_headless && !SDL_Vulkan_CreateSurface(s_win, s_inst, &s_surface)) {
+    if (!s_headless && !nv2a_vk_host_surface(s_inst, &s_surface)
+            && !SDL_Vulkan_CreateSurface(s_win, s_inst, &s_surface)) {
         LOGE("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
         s_headless = 1;
     }
@@ -2074,17 +2135,30 @@ static int ready(void)
     if (!s_headless)
         dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
-    dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
-#if defined(__APPLE__)
-    {                         /* required by the spec wherever it is offered */
+    {
         VkExtensionProperties ep[256];
         uint32_t ne = 256;
+        int have_vi = 0;
         vkEnumerateDeviceExtensionProperties(s_pd, NULL, &ne, ep);
-        for (i = 0; i < ne; i++)
-            if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset"))
+        for (i = 0; i < ne; i++) {
+            if (!strcmp(ep[i].extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))
+                have_vi = 1;
+#if defined(__APPLE__)
+            /* Required by the spec wherever it is offered. */
+            if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) {
                 dext[ndext++] = "VK_KHR_portability_subset";
-    }
+                s_fan_lists = 1;
+            }
 #endif
+        }
+        if (have_vi) {
+            dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+        } else {
+            s_static_vi = 1;
+            f13.pNext = NULL;               /* no vertex-input feature to ask for */
+            fprintf(stderr, "  [VK] no VK_EXT_vertex_input_dynamic_state: vertex formats go into the pipelines\n");
+        }
+    }
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
@@ -2092,13 +2166,17 @@ static int ready(void)
     dci.ppEnabledExtensionNames = dext;
     (void)feds;
     if (vkCreateDevice(s_pd, &dci, NULL, &s_dev) != VK_SUCCESS) {
-        LOGE("vkCreateDevice failed (needs push descriptors, dynamic vertex input, Vulkan 1.3)\n");
+        LOGE("vkCreateDevice failed (needs push descriptors, Vulkan 1.3)\n");
         return 0;
     }
     vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
 #define GET(p, name) p = (void *)vkGetDeviceProcAddr(s_dev, name); if (!p) { LOGE("missing %s\n", name); return 0; }
     GET(p_push_desc, "vkCmdPushDescriptorSetKHR");
-    GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    if (s_static_vi) {
+        GET(p_bind_vb2, "vkCmdBindVertexBuffers2");
+    } else {
+        GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    }
     GET(p_begin_rendering, "vkCmdBeginRendering");
     GET(p_end_rendering, "vkCmdEndRendering");
     GET(p_cull_mode, "vkCmdSetCullMode");
@@ -2364,7 +2442,26 @@ static int prim_indices(const Nv2aRawBatch *b, const uint32_t **idx, uint32_t *n
     case 4: *topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; *cls = 1; return 1;
     case 5: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; *cls = 2; return 1;
     case 6: case 9: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; *cls = 2; return 1;
-    case 7: case 10: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; *cls = 2; return 1;
+    case 7: case 10:
+        if (!s_fan_lists) { *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; *cls = 2; return 1; }
+        {                                        /* fan -> triangles (s_fan_lists) */
+            size_t need = b->index_count >= 3 ? ((size_t)b->index_count - 2) * 3 : 0;
+            if (need > s_prim_cap) {
+                free(s_prim_idx);
+                s_prim_cap = need + 1024;
+                s_prim_idx = (uint32_t *)malloc(s_prim_cap * 4);
+            }
+            if (!need || !s_prim_idx) { *n = 0; return 0; }
+            for (i = 1; i + 1 < b->index_count; i++) {
+                s_prim_idx[m++] = b->indices[0];
+                s_prim_idx[m++] = b->indices[i];
+                s_prim_idx[m++] = b->indices[i + 1];
+            }
+            *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; *cls = 2;
+            *idx = s_prim_idx;
+            *n = m;
+            return 1;
+        }
     case 3:                                      /* LINE_LOOP: strip + first */
     case 8: {                                    /* QUADS -> triangles */
         size_t need = b->prim == 3 ? (size_t)b->index_count + 1 : (size_t)b->index_count / 4 * 6;
@@ -2526,6 +2623,19 @@ static void attr_to_float4(const Nv2aRawBatch *b, uint32_t a, uint32_t v, float 
     }
 }
 
+/* The format each location gets in upload_vertices: the title's own for
+ * attributes uploaded as stored, float4 for converted and absent ones. */
+static void vertex_formats_key(const Nv2aRawBatch *b, uint32_t *vfmt)
+{
+    uint32_t a;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        VkFormat f = VK_FORMAT_UNDEFINED;
+        if (b->attr_direct & (1u << a))
+            f = vertex_format(b->direct[a].type, b->direct[a].size);
+        vfmt[a] = (uint32_t)(f != VK_FORMAT_UNDEFINED ? f : VK_FORMAT_R32G32B32A32_SFLOAT);
+    }
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -2613,8 +2723,16 @@ static int upload_vertices(const Nv2aRawBatch *b)
             offs[a] = at + const_at + a * 16;
         }
     }
-    p_vertex_input(s_cb, NV2A_RAW_ATTRS, bind, NV2A_RAW_ATTRS, attr);
-    vkCmdBindVertexBuffers(s_cb, 0, NV2A_RAW_ATTRS, bufs, offs);
+    if (s_static_vi) {
+        /* The formats are in the pipeline (vertex_formats_key). */
+        VkDeviceSize strides[NV2A_RAW_ATTRS];
+        for (a = 0; a < NV2A_RAW_ATTRS; a++)
+            strides[a] = bind[a].stride;
+        p_bind_vb2(s_cb, 0, NV2A_RAW_ATTRS, bufs, offs, NULL, strides);
+    } else {
+        p_vertex_input(s_cb, NV2A_RAW_ATTRS, bind, NV2A_RAW_ATTRS, attr);
+        vkCmdBindVertexBuffers(s_cb, 0, NV2A_RAW_ATTRS, bufs, offs);
+    }
     return 1;
 }
 
@@ -2911,6 +3029,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     }
     key.depth = d != NULL;
     key.topo = cls;
+    if (s_static_vi)
+        vertex_formats_key(b, key.vfmt);
     pipe = pipe_get(&key);
     if (!pipe)
         return;
@@ -3381,7 +3501,7 @@ static void vk_flip(void)
     frame_begin();
     VT("flip %u: next frame recording\n", s_frame);
     s_dyn_valid = 0;
-#if !defined(__SWITCH__)
+#if !defined(__SWITCH__) && !defined(__APPLE__)   /* Apple: the host's main thread pumps */
     if (s_win) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) { }

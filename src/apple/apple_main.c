@@ -39,6 +39,42 @@ int nv2a_gl_adopt_window(void **win, void **ctx)
     *ctx = s_ctx;
     return 1;
 }
+#else
+#include <SDL_vulkan.h>
+#include <dispatch/dispatch.h>
+
+/* nv2a_vk.c: the window, and its surface made on the main thread (SDL adds
+ * a Metal view to the window for it). The renderer asks from its own thread;
+ * the main thread serves the main queue while it waits for events. */
+int nv2a_vk_adopt_window(void **win)
+{
+    if (!s_win)
+        return 0;
+    *win = s_win;
+    return 1;
+}
+
+typedef struct { VkInstance inst; VkSurfaceKHR *surface; SDL_bool ok; } SurfaceReq;
+
+static void make_surface(void *arg)
+{
+    SurfaceReq *r = (SurfaceReq *)arg;
+    r->ok = SDL_Vulkan_CreateSurface(s_win, r->inst, r->surface);
+}
+
+int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
+{
+    SurfaceReq r = { inst, surface, SDL_FALSE };
+    if (!s_win)
+        return 0;
+    if (pthread_main_np())
+        make_surface(&r);
+    else
+        dispatch_sync_f(dispatch_get_main_queue(), &r, make_surface);
+    if (!r.ok)
+        fprintf(stderr, "[apple] Vulkan surface: %s\n", SDL_GetError());
+    return r.ok ? 1 : 0;
+}
 #endif
 
 static void *game_thread(void *arg)
@@ -81,6 +117,16 @@ int main(int argc, char **argv)
         return 1;
     }
     SDL_GL_MakeCurrent(s_win, NULL);    /* the executor thread takes it */
+#else
+    {
+        const char *h = getenv("RECOMP_VK_HEADLESS");
+        if (!(h && *h == '1')) {
+            s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                     1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+            if (!s_win)
+                fprintf(stderr, "[apple] Vulkan window: %s\n", SDL_GetError());
+        }
+    }
 #endif
     s_done_event = SDL_RegisterEvents(1);
 
