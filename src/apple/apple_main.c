@@ -28,6 +28,8 @@
 #endif
 void ios_host_setup(void);              /* src/ios/ios_host.c */
 int ios_attach_window_to_scene(SDL_Window *window);   /* src/ios/ios_scene.m */
+void ios_touch_attach(SDL_Window *window);            /* src/ios/ios_touch.m */
+void ios_touch_controllers_changed(void);
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
@@ -69,6 +71,10 @@ static void make_surface(void *arg)
 {
     SurfaceReq *r = (SurfaceReq *)arg;
     r->ok = SDL_Vulkan_CreateSurface(s_win, r->inst, r->surface);
+#if TARGET_OS_IPHONE
+    if (r->ok)
+        ios_touch_attach(s_win);        /* above the Metal view SDL just added */
+#endif
 }
 
 int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
@@ -141,6 +147,7 @@ int main(int argc, char **argv)
     ios_host_setup();                   /* paths, settings file, log */
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     SDL_SetHint(SDL_HINT_IDLE_TIMER_DISABLED, "1");   /* no auto-lock during movies */
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
 #endif
     /* Controllers too: macOS delivers their arrival and input through the
      * main run loop, which only this thread pumps. */
@@ -207,6 +214,10 @@ int main(int argc, char **argv)
         }
         if (e.type == s_done_event)
             return s_rc;
+#if TARGET_OS_IPHONE
+        if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED)
+            ios_touch_controllers_changed();
+#endif
     }
 }
 
