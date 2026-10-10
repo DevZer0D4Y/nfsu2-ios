@@ -240,3 +240,33 @@ Darwin's ABI and libc, and 16 KB pages.
   - 670 functions with MMIO accessors (DSOUND, XPP);
   - 159 unresolved call targets stubbed; 3,501 `TODO:` sites (`RECOMP_UNIMPL`, reported at runtime).
 - No macOS-specific change was needed for the lift itself.
+
+### Step 3: Vulkan renderer on MoltenVK: **blocked (as expected)**
+
+- `cmake -S . -B build-macos-vk -G Ninja -DNFSU2_GEN_DIR=$PWD/gen -DNFSU2_VULKAN=ON -DCMAKE_PREFIX_PATH=/opt/homebrew -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)`
+  configures with CMake 4.4.4 (no policy override needed).
+- `cmake --build build-macos-vk -j6`: **all 2.49 M lines of lifted C compile with Apple clang 21 with no errors**,
+  and it links (25 MB binary). The predicted `-lstdc++` problem did not happen: Apple's linker resolved it to
+  `/usr/lib/libc++.1.dylib` (`otool -L`), so `nv2a_vk/CMakeLists.txt` is unchanged.
+  Linked: Homebrew SDL2, libepoxy, OpenSSL, glslang 16, SPIRV-Tools, `libvulkan.1.dylib` (loader).
+- Headless run (`RECOMP_VK_HEADLESS=1`, cwd `build-macos-vk/run/`, killed after 60 s): **the title boots on
+  arm64 macOS.**
+  - Memory layout is complete: base `0x7000000000`, 14/14 sections, 152/152 kernel thunks bridged, all
+    apertures, 28/28 mirrors.
+  - The APU is up and the guest starts at `0x0021B1CE`.
+  - The disc streams (`ZZDATA*.BIN`; the opens that fail are the title probing ZZDATA10–15 and TDATA
+    `contentmeta.xbx`, which the disc does not have).
+  - The pushbuffer executor keeps up (DMA_PUT == DMA_GET), traps are handled, and OHCI0 enumerates the pad.
+  - Unlifted `in/out dx` and `wbinvd` instructions are reached as no-ops.
+  - No crash in 60 s.
+- Renderer: `[VK] vkCreateInstance failed`. The loader hides MoltenVK unless the instance enables
+  `VK_KHR_portability_enumeration`. **Fix** (`nv2a_vk.c`, `#if defined(__APPLE__)`, 20 lines): enable it
+  plus `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR` when the loader offers it, and enable
+  `VK_KHR_portability_subset` at device creation when the device offers it (required by the spec).
+- Rerun: `[VK] Apple M1, Vulkan 1.3.357`, then
+  `[VK] vkCreateDevice failed (needs push descriptors, dynamic vertex input, Vulkan 1.3)`.
+  `vulkaninfo` on this machine (MoltenVK 1.4.2) lists `VK_KHR_push_descriptor`, `VK_KHR_dynamic_rendering`,
+  `VK_EXT_extended_dynamic_state`, `VK_KHR_portability_subset`, but **not
+  `VK_EXT_vertex_input_dynamic_state`**, and MoltenVK's own user guide does not list it either.
+  `nv2a_vk.c` requests it at device creation and calls `vkCmdSetVertexInputEXT` for every draw.
+  **Vulkan is blocked on Apple until nv2a_vk has a static vertex-input path. Switching to OpenGL.**

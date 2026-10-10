@@ -1966,6 +1966,20 @@ static int ready(void)
             layers[nlayers++] = "VK_LAYER_KHRONOS_validation";
     }
 #endif
+#if defined(__APPLE__)
+    /* MoltenVK behind the Vulkan loader is a portability driver: the loader
+     * lists it only for an instance that opts in. */
+    {
+        VkExtensionProperties ep[64];
+        uint32_t ne = 64;
+        vkEnumerateInstanceExtensionProperties(NULL, &ne, ep);
+        for (i = 0; i < ne; i++)
+            if (!strcmp(ep[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+                iext[niext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+                ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            }
+    }
+#endif
     ai.pApplicationName = "nfsu2x";
     ai.pEngineName = "xboxrecomp";
     ai.apiVersion = VK_API_VERSION_1_3;
@@ -2061,6 +2075,16 @@ static int ready(void)
         dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
     dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+#if defined(__APPLE__)
+    {                         /* required by the spec wherever it is offered */
+        VkExtensionProperties ep[256];
+        uint32_t ne = 256;
+        vkEnumerateDeviceExtensionProperties(s_pd, NULL, &ne, ep);
+        for (i = 0; i < ne; i++)
+            if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset"))
+                dext[ndext++] = "VK_KHR_portability_subset";
+    }
+#endif
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
