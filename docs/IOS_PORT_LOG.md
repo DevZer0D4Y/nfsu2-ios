@@ -631,3 +631,49 @@ Device runs:
 - a performance profile (Instruments);
 - the pre-existing semaphore-reuse validation warning;
 - the native-override FMA drift.
+
+## 2026-10-10 — Phase 2: controller, touch controls, background pause, game import
+
+- **DualSense on the iPhone works** (owner confirmed): the SDL controller path from Phase 0 (rescan
+  of empty ports in `xinput_device.c`) carries over unchanged.
+- **Touch controls** (`src/ios/ios_touch.m`, commit `f8a24a6`):
+  - A transparent `UIView` over SDL's Metal view (added after the Vulkan surface is made, so it stays
+    on top) draws: a floating stick (left half, it centres where the finger lands), a D-pad,
+    BACK/START, A/B/X/Y, WHITE/BLACK (SDL's shoulder buttons) and BRAKE/GAS (the triggers). Each
+    press gives a light haptic tap; a finger sliding from one control to another moves the press.
+  - It feeds a **virtual SDL game controller** (`SDL_JoystickAttachVirtualEx`, 15 buttons, 6 axes),
+    so `xinput_device.c` reads it like any pad and no shared code changed. SDL's automatic mapping
+    numbers the buttons and axes exactly as the `SDL_CONTROLLER_*` enums: checked on macOS with a
+    throwaway SDL test (every button lands on its own enum; triggers read 0 at rest, 32767 pressed).
+  - While a physical controller is connected the overlay hides and the virtual pad is detached, so
+    the real pad gets port 0 (`SDL_JOYDEVICEADDED/REMOVED` on the main loop). `NFSU2_TOUCH=0` turns
+    it off, `=2` keeps it on with a controller. The accelerometer is no longer a joystick.
+  - The iOS Simulator always reports a controller of its own ("Gamepad"), so the overlay hides there
+    unless `NFSU2_TOUCH=2`. Layout checked from Simulator screenshots; touch input itself is
+    **awaiting a device test** (the Simulator cannot be tapped from the command line).
+  - Button functions in NFSU2 are the Xbox ones; the in-game controls screen lists them.
+- **Background pause** (`apple_main.c`, `xa2_pause` in `apu_xaudio2.c`, commit `fa5017b`):
+  - Before: the device log showed the guest running on in the background (~28k kernel calls before
+    suspension) and the APU looping the title's sound buffers, which nothing refilled.
+  - Now, on `SDL_APP_WILLENTERBACKGROUND` (also Control Center / notification pull-down), a host
+    thread takes the guest lock and holds it until `DIDENTERFOREGROUND`, the SDL audio device is
+    paused (its queue dropped on resume), and the GPU gate stays as before. The main thread never
+    waits for the lock.
+  - Simulator: `[ios] guest paused` right after going to Settings; no kernel calls and a fixed
+    `DMA_PUT` while away; back to 59.9 fps after return. Device test pending.
+- **Game import** (`src/ios/ios_import.m`, commit `b4e09ba`):
+  - When `Documents/game/default.xbe` is missing, a screen asks for the extracted disc folder (system
+    folder picker; a folder with the disc one level down also works). It checks free space, copies
+    with a progress bar into `game.import` (4 MB chunks, screen kept awake, background task), checks
+    `default.xbe` (4,038,656 bytes, SHA-1 `428b5a70…`), then moves the items into `Documents/game`.
+    A failed import removes `game.import`. Finder/Files copies still work and skip the screen.
+  - `NFSU2_IMPORT_FROM=<dir>` runs the same import without the picker. Simulator: 2,598 MB in ~6 s,
+    `diff -rq` against the source identical, then boot to 60 fps from the copy. A fake
+    `default.xbe` is refused with its SHA-1 shown and nothing left behind.
+- macOS GL and Vulkan builds still compile after each step.
+
+**Open:**
+- device test of the touch controls and the background pause;
+- FFmpeg VP6 for iOS (an LGPL dylib, per CLAUDE.md; the lifted decoder is enough on the A15 today);
+- thermal, long-session testing and an Instruments profile;
+- the semaphore-reuse validation warning; the native-override FMA drift.
