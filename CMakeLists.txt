@@ -34,8 +34,8 @@ endif()
 # links mesa-switch's static NVK (NVK_SDK) and builds nfsu2x-vulkan.nro.
 option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
 set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
-# Apple: the native Metal renderer too, chosen at run time with
-# NFSU2_RENDERER=metal (src/apple/apple_main.c); Vulkan stays the fallback.
+# Apple: the native Metal renderer too, the default at run time;
+# NFSU2_RENDERER=vulkan picks MoltenVK instead (src/apple/apple_main.c).
 if(APPLE AND NFSU2_VULKAN)
     option(NFSU2_METAL "Also build the Metal renderer" ON)
 else()

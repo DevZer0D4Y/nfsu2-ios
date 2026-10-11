@@ -13,9 +13,9 @@
  * backend dispatch_sync()s [NSOpenGLContext update]/setView from the render
  * thread to the main queue, which only runs while the main loop does.
  *
- * With NFSU2_METAL built in, NFSU2_RENDERER=metal picks the native Metal
- * renderer (nv2a_metal) over Vulkan/MoltenVK; its view and layer are made
- * here on the main thread as the Vulkan surface is.
+ * With NFSU2_METAL built in, the native Metal renderer (nv2a_metal) is used
+ * unless NFSU2_RENDERER=vulkan picks Vulkan/MoltenVK; its view and layer are
+ * made here on the main thread as the Vulkan surface is.
  */
 #if defined(__APPLE__)
 
@@ -250,8 +250,9 @@ int main(int argc, char **argv)
 #endif
 #if defined(NFSU2_METAL)
     {
+        /* Metal by default; NFSU2_RENDERER=vulkan keeps MoltenVK. */
         const char *r = getenv("NFSU2_RENDERER");
-        if (r && !strcmp(r, "metal")) {
+        if (!(r && !strcmp(r, "vulkan"))) {
             if (__builtin_available(macOS 14.0, iOS 17.0, *))
                 s_metal = 1;
             else
