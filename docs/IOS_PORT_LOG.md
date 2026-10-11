@@ -767,3 +767,31 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   copy and launch went through, but log read-back hung, and earlier the app was backgrounded by the
   screen lock. Needs the phone on USB, unlocked, Auto-Lock off. The phone's `nfsu2x_env.txt` may still
   hold the A/B settings (Metal, race pad script, `RECOMP_FPS_LOG=1`).
+
+## 2026-10-11 — Owner report: laggy cutscenes, speech breaking up; FFmpeg VP6 on Apple
+
+- **Owner:** cutscenes are very laggy; someone talking over the radio sometimes tears up / lags.
+- **Device log** (a later launch of mine, the owner's session was overwritten): thermal state already
+  `serious` ~20 s after launch (after several back-to-back test runs); during the intro movies the
+  game thread at 61% of a core, the executor 31%. SDL output queue 8 x 256 samples (43 ms).
+- **Where a movie frame's time goes** (macOS `sample` of the game thread during the intro movies):
+  62% spinning in D3D's fence wait `sub_002E8F20` (BlockOnTime: `recomp_spin_yield` → `swtch_pri`,
+  i.e. a core kept busy waiting for the executor), 29% `yuv_row_native` (the NEON YUV→ARGB rows,
+  ~2.6 ms/frame), 6% the VP6 decode itself. The spin is upstream's design (a sleep there slowed the
+  game, UPSTREAM_NOTES); not changed without device numbers. On a phone it costs heat, and heat
+  throttles everything — the likely link between the movies and the sound.
+- **FFmpeg for Apple** (commit `a149720`): `tools/build_ffmpeg_apple.sh macos|sim|device` builds the
+  vp6-only LGPL 2.1 FFmpeg 7.1.1 (sha256 `733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`,
+  no gpg here to check the signature) as `avcodec`/`avutil` **dynamic frameworks** (`@rpath`
+  install names), `cmake/apple_ffmpeg.cmake` links and ships them (Xcode embeds and signs, the Ninja
+  Simulator build copies them, macOS uses an rpath) with `FFmpeg-COPYING.LGPLv2.1`. Root CMake: one
+  `if(APPLE ...)` branch in front of upstream's FFmpeg block.
+  - macOS `NFSU2_NATIVE_VP6=2`: 900 frames, 0 differ; 0.9 ms/frame. Game thread during movies 66-70%
+    → 60-62% (the rest is the spin and the colour rows).
+  - Simulator: decoder FFmpeg, 0.6 ms/frame, APU 1500 frames/s, 0 underruns.
+  - Device: built with the frameworks embedded and signed (team YOURTEAMID), installed.
+- **Audio diagnostics on Apple** (commit `41ff7dc`): the `[perf]` report now has the APU rate (1500 =
+  real time), pacing, output-queue underruns/drops and stale ring-voice samples, so the next device
+  log tells whether speech breaks up because the APU falls behind, the game's mixer is late, or the
+  output queue runs dry. Next: a device session with movies and the radio speech, then decide (queue
+  depth for iOS, the fence spin, thermal).
