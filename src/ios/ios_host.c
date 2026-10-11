@@ -16,6 +16,13 @@
  * Settings from the file win over the defaults set here; the simulator's
  * launch environment (SIMCTL_CHILD_*) arrives before either and is kept
  * unless the file names the same key.
+ *
+ * For measurements driven from the Mac when the device's file service will
+ * not move files (it can hang while the log grows), two launch variables
+ * (devicectl ... process launch --console, DEVICECTL_CHILD_*):
+ *   NFSU2_LOG_CONSOLE=1   the log stays on stdout/stderr (to the console)
+ *   NFSU2_ENV_FILE=0      nfsu2x_env.txt is not read: the launch
+ *                         environment is the whole configuration
  */
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -86,13 +93,19 @@ void ios_host_setup(void)
     mkdir(caches, 0755);
 
 #if !TARGET_OS_SIMULATOR
-    path_join(path, sizeof path, docs, "nfsu2x_log.txt");
-    if (freopen(path, "w", stderr))
-        dup2(fileno(stderr), fileno(stdout));
+    {
+        const char *c = getenv("NFSU2_LOG_CONSOLE");
+        path_join(path, sizeof path, docs, "nfsu2x_log.txt");
+        if (!(c && *c == '1') && freopen(path, "w", stderr))
+            dup2(fileno(stderr), fileno(stdout));
+    }
 #endif
 
-    path_join(path, sizeof path, docs, "nfsu2x_env.txt");
-    nenv = read_env_file(path);
+    {
+        const char *e = getenv("NFSU2_ENV_FILE");
+        path_join(path, sizeof path, docs, "nfsu2x_env.txt");
+        nenv = (e && *e == '0') ? -1 : read_env_file(path);
+    }
 
     path_join(path, sizeof path, docs, "game");
     setenv("NFSU2_GAME_DIR", path, 0);
