@@ -69,7 +69,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 if(APPLE)
     enable_language(OBJC)
     target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c src/apple/apple_perf.m)
-    set_source_files_properties(src/apple/apple_perf.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(src/apple/apple_perf.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+                                INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
     target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Foundation")
 endif()
 
