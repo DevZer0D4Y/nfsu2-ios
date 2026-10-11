@@ -1359,27 +1359,34 @@ static void pipe_rec_append(const PipeKey *k)
     }
 }
 
-static id<MTLRenderPipelineState> pipe_get(const PipeKey *k)
+static uint32_t pipe_hash(const PipeKey *k)
 {
     const uint32_t *w = (const uint32_t *)k;
     uint32_t h = 2166136261u, i;
-    int e;
-    PipeEnt *pe;
-    MtProg *p = &s_prog[k->prog];
-    MTLRenderPipelineDescriptor *d;
-    MTLVertexDescriptor *vd;
-    NSError *err = nil;
-    id<MTLRenderPipelineState> pipe;
-    id<MTLFunction> vs;
-
     for (i = 0; i < sizeof *k / 4; i++)
         h = (h ^ w[i]) * 16777619u;
-    h &= PIPE_BUCKETS - 1;
+    return h & (PIPE_BUCKETS - 1);
+}
+
+static id<MTLRenderPipelineState> pipe_find(const PipeKey *k, uint32_t h)
+{
+    int e;
     for (e = s_pipe_head[h]; e; e = s_pipes[e - 1].next)
         if (s_pipes[e - 1].pipe && !memcmp(&s_pipes[e - 1].key, k, sizeof *k))
             return s_pipes[e - 1].pipe;
+    return nil;
+}
 
-    vs = k->points ? prog_vs_points(p) : p->vs;
+/* What the pipeline for k is made from; nil when its program has no
+ * vertex function for it. */
+static MTLRenderPipelineDescriptor *pipe_desc(const PipeKey *k)
+{
+    MtProg *p = &s_prog[k->prog];
+    MTLRenderPipelineDescriptor *d;
+    MTLVertexDescriptor *vd;
+    id<MTLFunction> vs = k->points ? prog_vs_points(p) : p->vs;
+    uint32_t i;
+
     if (!vs)
         return nil;
     d = [MTLRenderPipelineDescriptor new];
@@ -1415,16 +1422,17 @@ static id<MTLRenderPipelineState> pipe_get(const PipeKey *k)
     }
     if (k->points)
         d.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
-    VT("newRenderPipelineState prog %d blend %u cmask %X depth %u points %u\n", k->prog, k->blend,
-       k->cmask, k->depth, k->points);
-    pipe = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
-    if (!pipe) {
-        LOGE("pipeline creation failed: %s\n", err.localizedDescription.UTF8String);
-        return nil;
-    }
+    return d;
+}
+
+static void pipe_insert(const PipeKey *k, uint32_t h, id<MTLRenderPipelineState> pipe)
+{
+    PipeEnt *pe;
     if (s_npipes == MTL_MAX_PIPE) {
-        LOGE("pipeline table full\n");
-        return pipe;
+        static int warned;
+        if (!warned++)
+            LOGE("pipeline table full\n");
+        return;
     }
     pe = &s_pipes[s_npipes];
     pe->key = *k;
@@ -1433,6 +1441,27 @@ static id<MTLRenderPipelineState> pipe_get(const PipeKey *k)
     pe->next = s_pipe_head[h];
     s_pipe_head[h] = ++s_npipes;
     pipe_rec_append(k);
+}
+
+static id<MTLRenderPipelineState> pipe_get(const PipeKey *k)
+{
+    uint32_t h = pipe_hash(k);
+    MTLRenderPipelineDescriptor *d;
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pipe = pipe_find(k, h);
+
+    if (pipe)
+        return pipe;
+    if (!(d = pipe_desc(k)))
+        return nil;
+    VT("newRenderPipelineState prog %d blend %u cmask %X depth %u points %u\n", k->prog, k->blend,
+       k->cmask, k->depth, k->points);
+    pipe = [s_dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pipe) {
+        LOGE("pipeline creation failed: %s\n", err.localizedDescription.UTF8String);
+        return nil;
+    }
+    pipe_insert(k, h, pipe);
     return pipe;
 }
 
@@ -1447,16 +1476,75 @@ static MtProg *prog_find(uint64_t vkey, const Nv2aPshKey *pk)
     return NULL;
 }
 
+/* Compile what the recorded programs need, all at once: Metal compiles
+ * asynchronous requests in parallel (its compiler service), so prewarm takes
+ * about the time of the slowest library instead of the sum. The libraries
+ * land in s_libs, where prog_get then finds them. */
+static uint32_t prewarm_libraries(const char *path)
+{
+    static char vsrc[512 * 1024], fsrc[128 * 1024];
+    NSMutableDictionary<NSNumber *, NSString *> *todo = [NSMutableDictionary new];
+    NSMutableDictionary<NSNumber *, id<MTLLibrary>> *done = [NSMutableDictionary new];
+    dispatch_group_t g = dispatch_group_create();
+    __block uint32_t failed = 0;
+    ProgRec rec;
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    while (fread(&rec, sizeof rec, 1, f) == 1) {
+        const char *srcs[2] = { vsrc, fsrc };
+        int i;
+        if (rec.magic != PROG_REC_MAGIC || rec.slots > 136)
+            break;
+        if (nv2a_msl_vertex(rec.xform == 2 ? (const uint32_t (*)[4])rec.prog : NULL,
+                            rec.slots ? rec.slots : 136, rec.vp_start, vsrc, sizeof vsrc) < 0
+         || nv2a_msl_fragment(&rec.pk, fsrc, sizeof fsrc) < 0)
+            continue;
+        for (i = 0; i < 2; i++) {
+            NSNumber *k = @(text_hash(srcs[i]));
+            if (!s_libs[k] && !todo[k])
+                todo[k] = [NSString stringWithUTF8String:srcs[i]];
+        }
+    }
+    fclose(f);
+    for (NSNumber *k in todo) {
+        dispatch_group_enter(g);
+        [s_dev newLibraryWithSource:todo[k] options:s_copts
+                  completionHandler:^(id<MTLLibrary> lib, NSError *err) {
+            @synchronized (done) {
+                if (lib)
+                    done[k] = lib;
+                else
+                    failed++;
+            }
+            dispatch_group_leave(g);
+        }];
+    }
+    dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+    [s_libs addEntriesFromDictionary:done];
+    if (failed)
+        LOGE("prewarm: %u shader libraries failed to compile\n", failed);
+    return (uint32_t)done.count;
+}
+
 static void prewarm(void)
 {
     char path[256];
     FILE *f;
-    uint64_t t0 = hz_now();
-    uint32_t nprog = 0, npipe = 0, bad = 0;
+    uint64_t t0 = hz_now(), t1;
+    uint32_t nprog = 0, npipe = 0, nlib = 0, bad = 0;
     ProgRec rec;
     PipeRec pr;
+    PipeKey *keys = NULL;
+    uint32_t nkeys = 0, capkeys = 0, i;
 
     s_prewarming = 1;
+    if (cache_path(path, sizeof path, "progcache.bin")) {
+        @autoreleasepool {
+            nlib = prewarm_libraries(path);
+        }
+    }
     if (cache_path(path, sizeof path, "progcache.bin") && (f = fopen(path, "rb"))) {
         while (fread(&rec, sizeof rec, 1, f) == 1) {
             Nv2aRawBatch bb;
@@ -1469,6 +1557,7 @@ static void prewarm(void)
         }
         fclose(f);
     }
+    t1 = hz_now();
     if (cache_path(path, sizeof path, "mtlpipes.bin") && (f = fopen(path, "rb"))) {
         while (fread(&pr, sizeof pr, 1, f) == 1) {
             MtProg *p;
@@ -1481,16 +1570,49 @@ static void prewarm(void)
             k.blend = pr.blend; k.bsrc = pr.bsrc; k.bdst = pr.bdst; k.beq = pr.beq;
             k.cmask = pr.cmask; k.depth = pr.depth; k.points = pr.points;
             memcpy(k.vfmt, pr.vfmt, sizeof k.vfmt);
-            @autoreleasepool {
-                if (pipe_get(&k))
-                    npipe++;
+            if (nkeys == capkeys) {
+                capkeys = capkeys ? capkeys * 2 : 256;
+                keys = (PipeKey *)realloc(keys, capkeys * sizeof *keys);
+                if (!keys) { nkeys = capkeys = 0; break; }
             }
+            keys[nkeys++] = k;
         }
         fclose(f);
     }
+    if (nkeys) {
+        /* Pipelines in parallel too; inserted here, on this thread. */
+        __strong id<MTLRenderPipelineState> *made =
+            (__strong id<MTLRenderPipelineState> *)calloc(nkeys, sizeof *made);
+        dispatch_group_t g = dispatch_group_create();
+        @autoreleasepool {
+            for (i = 0; i < nkeys && made; i++) {
+                MTLRenderPipelineDescriptor *d;
+                if (pipe_find(&keys[i], pipe_hash(&keys[i])) || !(d = pipe_desc(&keys[i])))
+                    continue;
+                dispatch_group_enter(g);
+                [s_dev newRenderPipelineStateWithDescriptor:d
+                                          completionHandler:^(id<MTLRenderPipelineState> ps, NSError *err) {
+                    made[i] = ps;              /* each request owns its slot */
+                    dispatch_group_leave(g);
+                }];
+            }
+            dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+        }
+        for (i = 0; i < nkeys && made; i++) {
+            uint32_t h = pipe_hash(&keys[i]);
+            if (made[i] && !pipe_find(&keys[i], h)) {
+                pipe_insert(&keys[i], h, made[i]);
+                npipe++;
+            }
+            made[i] = nil;
+        }
+        free(made);
+    }
+    free(keys);
     s_prewarming = 0;
-    fprintf(stderr, "  [MTL] prewarm: %u programs, %u pipelines in %.0f ms%s\n",
-            nprog, npipe, (hz_now() - t0) / 1e6, bad ? " (a file ends in a bad record)" : "");
+    fprintf(stderr, "  [MTL] prewarm: %u programs (%u libraries compiled), %u pipelines in %.0f ms"
+            " (programs %.0f ms)%s\n", nprog, nlib, npipe, (hz_now() - t0) / 1e6, (t1 - t0) / 1e6,
+            bad ? " (a file ends in a bad record)" : "");
 }
 
 /* ── Fixed shaders: copies and clears ─────────────────────────────── */
