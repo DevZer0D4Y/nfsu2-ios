@@ -39,6 +39,7 @@ int ios_import_game(const char *game_dir);            /* src/ios/ios_import.m */
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
+void apple_perf_start(void);            /* apple_perf.m: [perf] lines */
 
 static SDL_Window   *s_win;
 static SDL_GLContext s_ctx;
@@ -215,6 +216,7 @@ static void *game_thread(void *arg)
     SDL_Event e;
 
     (void)arg;
+    pthread_setname_np("game");         /* the title's main thread, in [perf] lines */
     s_rc = nfsu2_game_main();
     SDL_zero(e);
     e.type = s_done_event;
@@ -309,6 +311,7 @@ int main(int argc, char **argv)
         pthread_detach(th);
 #endif
     pthread_attr_destroy(&attr);
+    apple_perf_start();
 
     for (;;) {
         SDL_Event e;
