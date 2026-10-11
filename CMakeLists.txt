@@ -67,7 +67,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 # AppKit owns the main thread: window and events there, the title on its own
 # thread (src/apple/apple_main.c).
 if(APPLE)
-    target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c)
+    enable_language(OBJC)
+    target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c src/apple/apple_perf.m)
+    set_source_files_properties(src/apple/apple_perf.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Foundation")
 endif()
 
 # iOS app: SDL's UIKit glue runs apple_main.c's main as SDL_main; Vulkan via
