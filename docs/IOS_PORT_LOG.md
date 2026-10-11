@@ -747,3 +747,23 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
 - Pipeline compile hitches on first use: async prewarm and/or an `MTLBinaryArchive`.
 - Partial-mask colour clears (logged, as in nv2a_vk); point sprites use size 1.
 - Device test of the touch controls (Phase 2) still pending.
+
+## 2026-10-11 — Phase 3: measuring Metal against MoltenVK, parallel prewarm
+
+- **`[perf]` line** (`src/apple/apple_perf.m`, commit `fcde7e8`; with `RECOMP_FPS_LOG=1`): every 10 s the
+  process's CPU time, the six busiest threads (Mach thread times; the title's main thread is named
+  `game`) and the thermal state (`NSProcessInfo`; iOS has no C API for it).
+- **macOS race A/B (M1, same race script, 30 fps cap):** Metal 53–55% of a core, renderer/executor
+  thread 25–26%; MoltenVK 55–56%, executor 26–27%. Draws per frame ~2450 → ~1500 calls on both
+  (instancing behaves alike). `sample` of the Metal executor thread: ~40% waiting in
+  `nv2a_pb_exec_method` (traps / flips), most of the rest decoding (`draw_primitive`, `cull_batch`,
+  `draw_inline_array`); `mtl_draw_raw` and below only ~11% of the thread (~3% of a core). On the M1
+  the back end is too small a part of the frame for the API to show; the A15 (slower CPU, MoltenVK's
+  translation on top) is where a difference could appear.
+- **Parallel prewarm** (commit `d8b4a9b`): every recorded library and pipeline goes to Metal's
+  asynchronous compiler at once. macOS, warm shader cache: 53 programs + 99 pipelines 79 → 26 ms.
+  Menu run with Metal validation: picture correct, no first-use compile during the run.
+- **Device A/B not done:** the iPhone was only reachable over Wi-Fi (`available (paired)`): settings
+  copy and launch went through, but log read-back hung, and earlier the app was backgrounded by the
+  screen lock. Needs the phone on USB, unlocked, Auto-Lock off. The phone's `nfsu2x_env.txt` may still
+  hold the A/B settings (Metal, race pad script, `RECOMP_FPS_LOG=1`).
