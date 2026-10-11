@@ -795,3 +795,32 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   log tells whether speech breaks up because the APU falls behind, the game's mixer is late, or the
   output queue runs dry. Next: a device session with movies and the radio speech, then decide (queue
   depth for iOS, the fence spin, thermal).
+
+## 2026-10-11 — Device A/B: Metal is the default; movies via FFmpeg on the phone
+
+- **Getting logs off the phone:** `devicectl device copy from` hung (even for a 100-byte file, also
+  after restarting the Mac's CoreDeviceService) after several runs; installs and process control still
+  worked. Runs are now driven with `devicectl device process launch --console` and the settings as
+  `DEVICECTL_CHILD_*` launch variables: `NFSU2_LOG_CONSOLE=1` keeps the log on the console,
+  `NFSU2_ENV_FILE=0` skips `nfsu2x_env.txt` (`src/ios/ios_host.c`, commit `48fa407`). Later, with the app
+  stopped, file copies worked again (37 s for a small file).
+- **iPhone 13 Pro, same scripted run (movies → menus → driving), 3 min each, Metal first:**
+
+  | | Metal | MoltenVK |
+  |---|---|---|
+  | prewarm | 105 programs, 192 pipelines, 27 ms | 106 programs, 150 pipelines, 259 ms |
+  | movies (CPU) | 108–117% | 107–124% |
+  | menus | 47–51%, 59.9 fps | 49–52%, 59.9 fps |
+  | driving (CPU / renderer thread) | 48–54% / 21–24% | 50–57% / 23–26% |
+  | draws → calls | ~2450 → ~1500 | ~2500 → ~1550 |
+  | thermal | nominal → fair | fair → serious (ran second, warmer phone) |
+
+  Pictures correct throughout (earlier dumps: menus, race, open world). **Metal is now the default on
+  Apple** (commit `b76aeac`); `NFSU2_RENDERER=vulkan` picks MoltenVK.
+- **Movies on the phone:** FFmpeg 0.5–1.1 ms/frame, presented at 59.9 fps. The game thread during
+  movies is still ~60–65% of a core: D3D's fence spin and the YUV rows (see the movie profile above).
+- **Sound in these runs:** APU 1500 frames/s throughout, no output underruns after the first 10 s of
+  the first launch. One spike of stale ring samples (2.1%) in the window where FMVOpening starts —
+  the Mac shows the same 2.19% at the same point, so it is the movie switch, not the device. The
+  owner's speech breaking up (career radio calls) was not reached by the scripted run: needs a log of
+  a real session. The phone's settings file now holds only `RECOMP_FPS_LOG=1` (no pad script).
