@@ -40,6 +40,10 @@ void ios_verify_game(const char *game_dir);
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
+#if !TARGET_OS_IPHONE
+void apple_keyboard_controllers_changed(void);           /* apple_keyboard.c */
+void apple_keyboard_event(const SDL_Event *e);
+#endif
 void apple_perf_start(void);            /* apple_perf.m: [perf] lines */
 
 static SDL_Window   *s_win;
@@ -322,6 +326,9 @@ int main(int argc, char **argv)
     pthread_attr_destroy(&attr);
     apple_perf_start();
 
+#if !TARGET_OS_IPHONE
+    apple_keyboard_controllers_changed();   /* the keyboard as a pad (NFSU2_KEYBOARD=0: off) */
+#endif
     for (;;) {
         SDL_Event e;
         if (!SDL_WaitEvent(&e))
@@ -337,6 +344,10 @@ int main(int argc, char **argv)
 #if TARGET_OS_IPHONE
         if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED)
             ios_touch_controllers_changed();
+#else
+        apple_keyboard_event(&e);
+        if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED)
+            apple_keyboard_controllers_changed();
 #endif
     }
 }

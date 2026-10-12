@@ -906,3 +906,19 @@ Self-review (not a separate reviewer), at the owner's request after items 1–2.
   compiled on iOS, where nothing calls it (it warned there); the `-Wformat` in its macOS `shm_open`
   name (`(long)` cast). macOS GL, macOS Vulkan+Metal, Simulator and device build without warnings in
   these files; Mac and Simulator boot (28/28 RAM views mapped, 59.9 fps); device build installed.
+
+## 2026-10-12 — Mac keyboard controls
+
+- `src/apple/apple_keyboard.c` (new, macOS only): the keyboard drives a virtual SDL game controller,
+  like the iPhone touch controls, so no shared code changes; attached while no physical controller is
+  connected, detached when one is (a real pad keeps port 0). `NFSU2_KEYBOARD=0` off, `=2` always.
+  Layout: arrows = d-pad + left stick, W/S = gas/brake (triggers), A/D = steer, Enter = A + Start,
+  Esc/Backspace = B, Space/Shift = X/Y, Q/E = White/Black, Tab = Back, P = Start, IJKL = right stick.
+  Keys are released when the window loses focus; key repeats ignored.
+- Why Enter is A *and* Start: a pad-script check showed Start alone does not confirm NFSU2's dialogs
+  ("PROFILE has been loaded successfully — OK" stays), and the title screen wants Start.
+- Verified: a throwaway SDL test fed synthetic key events through `apple_keyboard_event` and read the
+  pad back through SDL's game-controller API (every mapping, opposite keys cancelling, release on focus
+  loss): all pass. In the game (DualSense hidden with `SDL_GAMECONTROLLER_IGNORE_DEVICES`):
+  `[keyboard] on`, `[INPUT] port 0: Keyboard`. With the DualSense on, it gets port 0 and the keyboard
+  stays off. Driving with real key presses is for the owner to try.
