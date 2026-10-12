@@ -824,3 +824,25 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   the Mac shows the same 2.19% at the same point, so it is the movie switch, not the device. The
   owner's speech breaking up (career radio calls) was not reached by the scripted run: needs a log of
   a real session. The phone's settings file now holds only `RECOMP_FPS_LOG=1` (no pad script).
+
+## 2026-10-12 — Radio speech in career free-roam drops out (owner report, open)
+
+- **Owner:** cutscenes now look fine. In career free-roam the radio speech plays a word or two, then
+  seconds of silence, then another word or two; not distorted. Cutscene audio and everything else play
+  fine.
+- **Owner's device session log** (pulled with `devicectl copy from`, works when the app is not
+  running): CPU ~50% of a core, thermal **nominal** throughout, APU 1500 frames/s, 0 output underruns,
+  stale ring samples ~0% (two spikes at loads), every file read succeeded (the only short reads are save
+  metadata at EOF). So not the device being slow, hot, or the output running dry.
+- **How NFSU2 plays sound** (new `RECOMP_APU_VOICE_LOG=1` in `apu_vp.c`: voice on/off/pause, stream
+  packet lists, stream starvation, ms stamps): the title switches on all its hardware voices once
+  (v0BA–v0D7 looping buffers, v0F4–v0F6 rings) and never off; no voice is a DirectSound stream (no SSL
+  packets at all). Its software engine refills those buffers, so speech that goes silent means the
+  game feeds it late or not at all — the cause is on the guest side (speech streaming/decoding or its
+  timing), not in the APU's stream path.
+- Mac reproduction with the phone's save (`~/nfsu2/game-phone`: links to the disc + the phone's
+  `UDATA`): the pad script reaches career explore mode (Main Menu → left → A …, garage
+  "Return to Explore Mode?" → left → A), but driving/radio triggers could not be scripted, and audio
+  cannot be judged by ear here. **Next:** the owner checks free-roam radio on the Mac build (same save,
+  DualSense over Bluetooth); if it breaks up there too it is a port bug shared by all platforms,
+  otherwise iOS-specific.
