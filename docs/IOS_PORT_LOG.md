@@ -901,3 +901,8 @@ Self-review (not a separate reviewer), at the owner's request after items 1–2.
   here but has not been run end to end on a clean Mac.
 - **Open:** iOS-only radio dropouts in career free-roam; first-run pipeline compiles (no binary
   archive); partial colour-mask clears; point size 1; long-session thermal test.
+- **Minors fixed (same day):** `apple_perf.m` drops threads that ended at each sample;
+  `CreateFileMappingA`'s iOS branch has its own error path (no `if (0) {`), and `anon_map_fd` is not
+  compiled on iOS, where nothing calls it (it warned there); the `-Wformat` in its macOS `shm_open`
+  name (`(long)` cast). macOS GL, macOS Vulkan+Metal, Simulator and device build without warnings in
+  these files; Mac and Simulator boot (28/28 RAM views mapped, 59.9 fps); device build installed.
