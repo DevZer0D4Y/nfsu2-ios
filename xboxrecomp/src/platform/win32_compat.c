@@ -2433,7 +2433,9 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 }
 #else
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
- * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
+ * memfd_create for this; elsewhere an immediately-unlinked temp file does.
+ * (iOS maps Mach memory entries instead: ios_vm.c.) */
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
 static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
@@ -2441,7 +2443,7 @@ static int anon_map_fd(const char *name)
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, (long)seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -2449,6 +2451,7 @@ static int anon_map_fd(const char *name)
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
 }
+#endif
 
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
@@ -2462,16 +2465,15 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     int fd = ios_mapping_create(size);
     (void)name;
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (0) {
 #else
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
-#endif
         close(fd);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+#endif
 
     w32_object *o = obj_alloc(K_FILEMAP);
     o->fd       = fd;

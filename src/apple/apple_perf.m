@@ -39,10 +39,11 @@ void  mcpx_apu_ring_stats(uint32_t *stale, uint32_t *total); /* apu_vp.c */
 typedef struct {
     uint64_t id;
     uint64_t us;               /* user + system CPU time at the last sample */
+    uint32_t sample;           /* the last sample that saw the thread */
 } PerfSeen;
 
 static PerfSeen s_seen[PERF_THREADS];
-static uint32_t s_nseen;
+static uint32_t s_nseen, s_sample;
 
 static uint64_t seen_swap(uint64_t id, uint64_t us)
 {
@@ -51,14 +52,26 @@ static uint64_t seen_swap(uint64_t id, uint64_t us)
         if (s_seen[i].id == id) {
             uint64_t prev = s_seen[i].us;
             s_seen[i].us = us;
+            s_seen[i].sample = s_sample;
             return prev;
         }
     if (s_nseen < PERF_THREADS) {
         s_seen[s_nseen].id = id;
         s_seen[s_nseen].us = us;
+        s_seen[s_nseen].sample = s_sample;
         s_nseen++;
     }
     return 0;                   /* new thread: all its time is this window's */
+}
+
+/* Threads that ended since the last sample give their slots back. */
+static void seen_prune(void)
+{
+    uint32_t i, n = 0;
+    for (i = 0; i < s_nseen; i++)
+        if (s_seen[i].sample == s_sample)
+            s_seen[n++] = s_seen[i];
+    s_nseen = n;
 }
 
 static const char *thermal_name(void)
@@ -116,6 +129,7 @@ static void sample(double secs, int print)
 
     if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS)
         return;
+    s_sample++;
     for (i = 0; i < n; i++) {
         thread_basic_info_data_t bi;
         thread_identifier_info_data_t ii;
@@ -157,6 +171,7 @@ next:
         mach_port_deallocate(mach_task_self(), th[i]);
     }
     vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof *th);
+    seen_prune();
     if (!print)
         return;
     at = (size_t)snprintf(line, sizeof line, "[perf] CPU %.0f%% of a core:", total / (secs * 1e4));
