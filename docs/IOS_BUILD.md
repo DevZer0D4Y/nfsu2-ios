@@ -56,7 +56,20 @@ XDG_DATA_HOME=$PWD/data NFSU2_GAME_DIR=$HOME/nfsu2/game ../build-macos-vk/nfsu2_
 ```
 
 Leave out `-DNFSU2_FFMPEG_DIR` to skip FFmpeg (movies then use the game's own, slower decoder).
-`NFSU2_RENDERER=vulkan` selects MoltenVK instead of Metal. A controller connected to the Mac works.
+`NFSU2_RENDERER=vulkan` selects MoltenVK instead of Metal. A controller connected to the Mac works;
+without one, the keyboard is the controller (`NFSU2_KEYBOARD=0` turns that off):
+
+| Keys | Xbox controller |
+|---|---|
+| Arrow keys | d-pad and left stick (menus, steering) |
+| W / S | right / left trigger (gas / brake, reverse) |
+| A / D | steer left / right |
+| Enter | A and Start together (Press START, OK, select, pause) |
+| Esc or Backspace | B (back) |
+| Space / Left Shift | X / Y |
+| Q / E | White / Black |
+| Tab / P | Back / Start |
+| I J K L | right stick |
 
 ## 5. iOS dependencies
 
