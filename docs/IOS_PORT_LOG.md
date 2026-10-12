@@ -852,3 +852,10 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   `shasum` of `~/nfsu2/game` on the Mac, file for file. `default.xbe` is the known NTSC-U build. The
   original `.7z` is gone, so the image itself cannot be checked against its archive CRCs; a damaged
   image would affect the Mac the same way, which the owner's Mac test will show.
+- **Owner's Mac test (2026-10-12):** career free-roam radio speech plays correctly on the macOS build
+  with the same game files (phone's save). So the disc image and the lifted code are fine and the
+  dropouts are iOS-specific. Owner chose not to test further on the iPhone for now: **left open,
+  not fixed** (no change since the owner's phone test touches it). Candidates for when it is picked up:
+  iOS thread scheduling of the title's stream/speech worker threads (default QoS can land them on
+  efficiency cores; CLAUDE.md's "map thread priorities to QoS" is not done yet), then a device run with
+  `RECOMP_APU_VOICE_LOG=1` + a `RECOMP_AUDIO_DUMP` of the radio moment compared with the Mac.
