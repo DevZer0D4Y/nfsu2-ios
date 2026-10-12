@@ -127,6 +127,16 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                 v | ((val << ctz32(mask)) & mask));
 }
 
+/* RECOMP_APU_VOICE_LOG=1: voice on/off/pause, stream packet lists and
+ * stream starvation, with a ms time stamp (speech dropping out). */
+static int vlog_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_VOICE_LOG") != NULL;
+    return on;
+}
+#define VLOG(...) do { if (vlog_on()) fprintf(stderr, "[VOICE] %lu ms " __VA_ARGS__); } while (0)
+
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
@@ -213,6 +223,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        VLOG("v%03X on fmt %08X\n", (unsigned long)GetTickCount(), (unsigned)selected_handle,
+             voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF));
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -324,10 +336,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        VLOG("v%03X off\n", (unsigned long)GetTickCount(), (unsigned)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        VLOG("v%03X pause %d\n", (unsigned long)GetTickCount(),
+             (unsigned)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE), (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -471,6 +486,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        VLOG("v%03X ssl A %u packets\n", (unsigned long)GetTickCount(), (unsigned)current_voice,
+             (unsigned)d->vp.ssl[current_voice].count[ssl]);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -481,6 +498,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        VLOG("v%03X ssl B %u packets\n", (unsigned long)GetTickCount(), (unsigned)current_voice,
+             (unsigned)d->vp.ssl[current_voice].count[ssl]);
         break;
     }
 
@@ -858,6 +877,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            VLOG("v%03X stream empty (ssl %d, %s)\n", (unsigned long)GetTickCount(), (unsigned)v,
+                 ssl_index, persist ? "persist: waits" : "voice off");
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
