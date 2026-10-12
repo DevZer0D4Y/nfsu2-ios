@@ -877,3 +877,27 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
 - **iPhone:** built, installed; a short console run booted normally through the movies, then the phone
   locked (background pause worked), so no `[perf]` readout from the device. Whether this cures the radio
   dropouts needs the owner's ear in career free-roam (left to the owner).
+
+## 2026-10-12 — Branch review (`ios`, 40+ commits over upstream `6e19726`)
+
+Self-review (not a separate reviewer), at the owner's request after items 1–2.
+
+- **Shared upstream files:** every change is behind `__APPLE__` / `TARGET_OS_IPHONE` / `IOS` (CMake
+  `APPLE`/`IOS`), except the controller rescan in `xinput_device.c` (Phase 0), which applies on every
+  platform on purpose: nothing called `xbox_InputInit`, so SDL pads never connected on Linux either.
+  `nv2a_vk.c` (+225, owner-approved in Phase 1) keeps its old paths where the Vulkan driver has the
+  extensions. `tools/{disasm,func_id,recomp}/output.py` were restored verbatim from xboxrecomp (MIT).
+- **Hygiene:** no file over 200 KB added; no game data, `gen/`, dumps, PCM captures or logs tracked (the
+  only `.xbe` is xboxrecomp's `tools/conformance/test.xbe`).
+- **Builds/tests at the end:** macOS GL and Vulkan+Metal, iOS device (Xcode) and Simulator (Ninja) all
+  build; `nv2a_metal_msl_test` 463 pairs, 0 failures.
+- **Re-read for defects:** Metal clears on passes with a depth buffer (depth state always set), the
+  feedback copy (Metal orders the blit after the previous reader), mid-draw ring flushes (space reserved
+  before the pass), the background gate before every commit and drawable. No defect found.
+- **Minor, deferred:** `apple_perf.m` never forgets threads that ended (its 256-entry table only matters
+  with `RECOMP_FPS_LOG=1` and heavy thread churn); `CreateFileMappingA`'s iOS branch uses an `if (0) {`
+  to share the error path (correct, not pretty); a pre-existing `-Wformat` warning in
+  `win32_compat.c` (`%ld` for `LONG`); `docs/IOS_BUILD.md` is assembled from the commands actually used
+  here but has not been run end to end on a clean Mac.
+- **Open:** iOS-only radio dropouts in career free-roam; first-run pipeline compiles (no binary
+  archive); partial colour-mask clears; point size 1; long-session thermal test.
