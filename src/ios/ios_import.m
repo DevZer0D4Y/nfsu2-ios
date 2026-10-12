@@ -335,3 +335,39 @@ int ios_import_game(const char *game_dir)
     win.hidden = YES;
     return 1;
 }
+
+/* NFSU2_VERIFY=1: the SHA-1 and size of every disc file under the game
+ * folder, in the log ("[verify] <sha1> <bytes> <path>"), to compare with the
+ * copy the game came from (shasum on the Mac) -- a transfer that damaged the
+ * data files. UDATA and TDATA are the title's own writes and are skipped. */
+void ios_verify_game(const char *game_dir)
+{
+    @autoreleasepool {
+        NSString *root = @(game_dir), *rel;
+        NSDirectoryEnumerator<NSString *> *e = [NSFileManager.defaultManager enumeratorAtPath:root];
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        unsigned long long total = 0;
+        unsigned n = 0, bad = 0;
+
+        while ((rel = [e nextObject])) {
+            NSDictionary *a = e.fileAttributes;
+            NSString *sha;
+            if ([a.fileType isEqualToString:NSFileTypeDirectory]) {
+                if ([rel isEqualToString:@"UDATA"] || [rel isEqualToString:@"TDATA"])
+                    [e skipDescendants];
+                continue;
+            }
+            if (![a.fileType isEqualToString:NSFileTypeRegular])
+                continue;
+            sha = xbe_sha1([root stringByAppendingPathComponent:rel]);
+            if (!sha)
+                bad++;
+            fprintf(stderr, "[verify] %s %llu %s\n", sha ? sha.UTF8String : "unreadable",
+                    a.fileSize, rel.UTF8String);
+            n++;
+            total += a.fileSize;
+        }
+        fprintf(stderr, "[verify] %u files, %llu MB, %u unreadable, %.0f s\n", n, total >> 20, bad,
+                CFAbsoluteTimeGetCurrent() - t0);
+    }
+}

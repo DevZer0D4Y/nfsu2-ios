@@ -846,3 +846,9 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   cannot be judged by ear here. **Next:** the owner checks free-roam radio on the Mac build (same save,
   DualSense over Bluetooth); if it breaks up there too it is a port bug shared by all platforms,
   otherwise iOS-specific.
+- **Game files ruled out (owner asked whether the image could be bad):** new `NFSU2_VERIFY=1` (launch
+  variable or settings line, `ios_import.m`) logs `[verify] <sha1> <bytes> <path>` for every disc file
+  before boot (UDATA/TDATA skipped). iPhone: 185 files, 2598 MB, 0 unreadable, 3 s; identical to
+  `shasum` of `~/nfsu2/game` on the Mac, file for file. `default.xbe` is the known NTSC-U build. The
+  original `.7z` is gone, so the image itself cannot be checked against its archive CRCs; a damaged
+  image would affect the Mac the same way, which the owner's Mac test will show.

@@ -36,6 +36,7 @@ int ios_attach_window_to_scene(SDL_Window *window);   /* src/ios/ios_scene.m */
 void ios_touch_attach(SDL_Window *window);            /* src/ios/ios_touch.m */
 void ios_touch_controllers_changed(void);
 int ios_import_game(const char *game_dir);            /* src/ios/ios_import.m */
+void ios_verify_game(const char *game_dir);
 #endif
 
 int nfsu2_game_main(void);              /* main.c */
@@ -247,6 +248,8 @@ int main(int argc, char **argv)
     SDL_AddEventWatch(app_events, NULL);
     if (getenv("NFSU2_GAME_DIR"))       /* the user's disc, picked in the app if missing */
         ios_import_game(getenv("NFSU2_GAME_DIR"));
+    if (getenv("NFSU2_VERIFY") && *getenv("NFSU2_VERIFY") == '1' && getenv("NFSU2_GAME_DIR"))
+        ios_verify_game(getenv("NFSU2_GAME_DIR"));      /* checksums of the disc files */
 #endif
 #if defined(NFSU2_METAL)
     {
