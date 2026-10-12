@@ -94,6 +94,14 @@ VULKAN=1 JOBS=6 NFSU2_GEN_DIR=/path/to/gen switch/build.sh
 
 </details>
 
+<details open>
+<summary><b>2c. macOS, iPhone and iPad</b> (Metal renderer; this fork)</summary>
+
+Step-by-step, from your own disc to the app on your phone: [docs/IOS_BUILD.md](docs/IOS_BUILD.md).
+Libraries and licences of the Apple builds: [docs/APPLE_NOTICES.md](docs/APPLE_NOTICES.md).
+
+</details>
+
 ### Project layout
 
 | Path | What |
