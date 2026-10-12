@@ -218,6 +218,11 @@ static void *game_thread(void *arg)
 
     (void)arg;
     pthread_setname_np("game");         /* the title's main thread, in [perf] lines */
+    {
+        /* A game thread in the user-interactive class, below audio (apple_qos.c). */
+        extern void xbox_apple_thread_qos(int priority);
+        xbox_apple_thread_qos(0);
+    }
     s_rc = nfsu2_game_main();
     SDL_zero(e);
     e.type = s_done_event;

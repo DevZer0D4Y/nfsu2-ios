@@ -1045,6 +1045,9 @@ void xbox_nx_retag_thread(void *entry) { (void)entry; }
 #endif
 
 static void host_priority_apply(w32_object *o);
+#if defined(__APPLE__)
+void xbox_apple_thread_qos(int priority);
+#endif
 
 static void *thread_trampoline(void *arg)
 {
@@ -1068,6 +1071,9 @@ static void *thread_trampoline(void *arg)
     }
 #endif
     host_priority_apply(o);              /* a priority set before it ran */
+#if defined(__APPLE__)
+    xbox_apple_thread_qos(o->priority);  /* apple_qos.c */
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -1238,6 +1244,10 @@ BOOL SetThreadPriority(HANDLE h, int priority)
     if (o && o->kind == K_THREAD) {
         o->priority = priority;
         host_priority_apply(o);
+#if defined(__APPLE__)
+        if (o == t_self_obj)
+            xbox_apple_thread_qos(priority);
+#endif
     }
     return TRUE;
 }
