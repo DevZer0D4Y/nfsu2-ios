@@ -859,3 +859,21 @@ Commits `8554bef` (MSL + test), `8aa11b9` (back end + wiring), `518ecbe` (static
   iOS thread scheduling of the title's stream/speech worker threads (default QoS can land them on
   efficiency cores; CLAUDE.md's "map thread priorities to QoS" is not done yet), then a device run with
   `RECOMP_APU_VOICE_LOG=1` + a `RECOMP_AUDIO_DUMP` of the radio moment compared with the Mac.
+
+## 2026-10-12 — Thread QoS on Apple (to-do item: "map thread priorities to QoS")
+
+- **Measured first** (`[perf]` lines now show each busy thread's scheduling priority, `pN`, which reflects
+  its QoS class): the title's main thread, the executor and every worker ran at **p31 = the default
+  class**; only system threads higher (p46). Darwin pthreads do not inherit their creator's QoS, and iOS
+  readily runs default-class work on the efficiency cores — a candidate for the iOS-only radio dropouts.
+- **Change** (`xboxrecomp/src/platform/apple_qos.c`, new; two guarded calls in `win32_compat.c`, one in
+  `apple_main.c`; `RECOMP_QOS=0` off): a thread sets its own class from its Win32 priority when it starts
+  and when it changes its own priority — above normal..time critical (APU frame thread, EA mixer):
+  user-interactive; normal (game threads, the title's main thread): user-interactive −1; below normal /
+  lowest: user-initiated; idle: utility. Audio stays above the game threads.
+- **macOS:** busy threads p46 (audio p47); menus 59.9 fps, APU 1500 frames/s. Same race, A/B:
+  `RECOMP_QOS=0` 74–88% of a core, QoS on 69–79% — no extra CPU from spin-waits at the higher class;
+  30 fps, 0 underruns, ~0% stale ring samples.
+- **iPhone:** built, installed; a short console run booted normally through the movies, then the phone
+  locked (background pause worked), so no `[perf]` readout from the device. Whether this cures the radio
+  dropouts needs the owner's ear in career free-roam (left to the owner).

@@ -2,7 +2,9 @@
  * apple_perf.m -- a [perf] line every 10 s on Apple hosts (RECOMP_FPS_LOG=1):
  * the process's CPU time, the busiest threads and the thermal state.
  *
- *   [perf] CPU 182% of a core: game 96%, 0x1a2b3 41%, SDLAudioP1 6%, ...; thermal nominal
+ *   [perf] CPU 182% of a core: game 96% p47, 0x1a2b3 41% p31, ...; thermal nominal
+ *   (pN: the thread's scheduling priority, which reflects its QoS class:
+ *    47 user-interactive, 37 user-initiated, 31 default, 20 utility)
  *
  *   [perf] APU 1500 frames/s (1500 = real time), frame thread 12% busy
  *   [perf] APU pacing: ...   (apu_core.c, as in the Switch report)
@@ -73,6 +75,7 @@ static const char *thermal_name(void)
 typedef struct {
     char     name[64];
     uint64_t us;
+    int      pri;              /* scheduling priority: shows the QoS class */
 } PerfTop;
 
 static void audio_report(void)
@@ -133,12 +136,17 @@ static void sample(double secs, int print)
         if (ntop < PERF_TOP || d > top[ntop - 1].us) {
             PerfTop t;
             t.us = d;
+            t.pri = -1;
             c = THREAD_EXTENDED_INFO_COUNT;
-            if (thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c) == KERN_SUCCESS
-                && ei.pth_name[0])
-                snprintf(t.name, sizeof t.name, "%s", ei.pth_name);
-            else
+            if (thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c) == KERN_SUCCESS) {
+                t.pri = ei.pth_priority;
+                if (ei.pth_name[0])
+                    snprintf(t.name, sizeof t.name, "%s", ei.pth_name);
+                else
+                    snprintf(t.name, sizeof t.name, "0x%llx", (unsigned long long)ii.thread_id);
+            } else {
                 snprintf(t.name, sizeof t.name, "0x%llx", (unsigned long long)ii.thread_id);
+            }
             if (ntop < PERF_TOP)
                 ntop++;
             for (k = ntop - 1; k > 0 && top[k - 1].us < t.us; k--)
@@ -153,8 +161,8 @@ next:
         return;
     at = (size_t)snprintf(line, sizeof line, "[perf] CPU %.0f%% of a core:", total / (secs * 1e4));
     for (k = 0; k < ntop && at < sizeof line; k++)
-        at += (size_t)snprintf(line + at, sizeof line - at, "%s %s %.0f%%", k ? "," : "",
-                               top[k].name, top[k].us / (secs * 1e4));
+        at += (size_t)snprintf(line + at, sizeof line - at, "%s %s %.0f%% p%d", k ? "," : "",
+                               top[k].name, top[k].us / (secs * 1e4), top[k].pri);
     if (at < sizeof line)
         snprintf(line + at, sizeof line - at, "; thermal %s, %u threads", thermal_name(), n);
     fprintf(stderr, "%s\n", line);

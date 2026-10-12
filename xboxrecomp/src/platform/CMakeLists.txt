@@ -25,6 +25,9 @@ if(WIN32)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
 else()
     add_library(platform STATIC win32_compat.c)
+    if(APPLE)
+        target_sources(platform PRIVATE apple_qos.c)  # thread QoS classes
+    endif()
     if(IOS)
         target_sources(platform PRIVATE ios_vm.c)   # file mappings without shm_open
     endif()
