@@ -922,3 +922,24 @@ Self-review (not a separate reviewer), at the owner's request after items 1–2.
   loss): all pass. In the game (DualSense hidden with `SDL_GAMECONTROLLER_IGNORE_DEVICES`):
   `[keyboard] on`, `[INPUT] port 0: Keyboard`. With the DualSense on, it gets port 0 and the keyboard
   stays off. Driving with real key presses is for the owner to try.
+
+## 2026-10-13 — Lifting on Windows (WSL2)
+
+- Goal: let Windows users run step 3 of `docs/IOS_BUILD.md` (`tools/regen.sh`) without a Mac, and
+  need one only for the Xcode build.
+- Environment: Windows 11 Pro, WSL2 (kernel 6.18.54.1), Ubuntu 24.04.1, 12 cores, 15 GiB. Python
+  3.12.3 (Ubuntu's) in `xboxrecomp/.venv` with capstone 5.0.9; apt: `python3.12-venv`, `p7zip-full`.
+  Same NTSC-U `default.xbe` (SHA-1 `428b5a70…`), unpacked with `tools.xiso` from the ISO.
+- Result: `regen.sh` runs unmodified, 1:59 wall (one core, peak RSS 1.1 GB), 83 files, 136,069,141
+  bytes. A second run into another directory gave the same SHA-256 for all 83 files. `gen/` contains
+  no absolute paths, timestamps or CRLF.
+- Fixed: `tools/*.sh` were committed as `100644`, so a fresh clone (Mac too) fails with
+  `tools/regen.sh: Permission denied`. All four are now `100755`.
+- Hit on the test machine, not repo bugs, now covered in the guide: stale WSL package lists (apt
+  404s until `apt-get update`); `python3` redirected to a deadsnakes 3.10 by `update-alternatives`
+  breaks Ubuntu's own `apt_pkg` hooks (the venv uses `/usr/bin/python3.12`, so regen is unaffected).
+- **Open:** not yet compared with a Mac-made `gen/`. The Mac (2026-10-10) had capstone 5.0.7 and
+  Python 3.13.7, so a difference would most likely come from capstone. To compare, on both sides:
+  `cd gen && find . -type f | LC_ALL=C sort | xargs sha256sum` (`shasum -a 256` on the Mac).
+- Docs: `docs/IOS_BUILD.md` "No Mac? Lift the code on Windows", with a pointer from step 3 and the
+  README.

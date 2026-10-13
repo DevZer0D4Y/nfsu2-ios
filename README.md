@@ -64,7 +64,9 @@ You need an Apple-silicon Mac with Xcode, your own NFSU2 Xbox disc (NTSC-U) and,
 Apple ID signed in to Xcode. In short:
 
 1. Install the tools (Homebrew, Python with capstone).
-2. Extract your disc and translate the game's code to C on your Mac (`tools/regen.sh`).
+2. Extract your disc and translate the game's code to C on your Mac (`tools/regen.sh`). This step
+   also runs on Windows under WSL2; see
+   [No Mac? Lift the code on Windows](docs/IOS_BUILD.md#no-mac-lift-the-code-on-windows).
 3. Build the libraries for iOS (`tools/build_ios_deps.sh`, `tools/build_ffmpeg_apple.sh`).
 4. Build and install the app from Xcode's command line.
 5. Copy your game folder to the phone and pick it in the app.

@@ -43,6 +43,8 @@ PATH=$PWD/xboxrecomp/.venv/bin:$PATH NFSU2_XBE=~/nfsu2/game/default.xbe \
     NFSU2_GEN_DIR=$PWD/gen tools/regen.sh
 ```
 
+This step also runs on Windows: see [No Mac? Lift the code on Windows](#no-mac-lift-the-code-on-windows).
+
 ## 4. macOS (to try it on the Mac)
 
 ```sh
@@ -141,6 +143,67 @@ Either:
 
 - The log of the last run is `Documents/nfsu2x_log.txt`; saves live in `Documents/game/UDATA`.
 - Leaving the app pauses the game, its sound and all GPU work.
+
+## No Mac? Lift the code on Windows
+
+Translating the game's code to C (step 3) doesn't need a Mac: it's plain Python and runs the same
+under WSL2 on Windows (tested on Ubuntu 24.04: about 2 minutes, identical output on every run). You
+still need a Mac, your own or a rented cloud Mac, for everything from step 4 on: Xcode, signing and
+installing on the iPhone.
+
+Set up WSL2 with Ubuntu (PowerShell as administrator, then reboot if asked), open **Ubuntu** from
+the Start menu and create your Linux user:
+
+```powershell
+wsl --install -d Ubuntu-24.04
+```
+
+Everything below runs in the Ubuntu terminal. Work under `~`, not under `/mnt/c/...`: Windows
+drives are much slower from WSL. Refresh the package lists first, or an older WSL install fails with
+"404 Not Found":
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git python3-venv p7zip-full     # p7zip only if your image is in a .7z
+git clone --branch ios https://github.com/myUdav4iik/nfsu2-ios.git ~/nfsu2-ios
+cd ~/nfsu2-ios
+python3 -m venv xboxrecomp/.venv
+xboxrecomp/.venv/bin/pip install 'capstone<6'
+
+cp "/mnt/c/Users/<you>/path/to/your.iso" ~/              # C: is /mnt/c
+cd xboxrecomp
+.venv/bin/python -m tools.xiso unpack ~/your.iso -o ~/nfsu2/game
+cd ..
+sha1sum ~/nfsu2/game/default.xbe     # must be 428b5a70b9400f19cc5be7679db6c72a6f80a1c9
+
+PATH=$PWD/xboxrecomp/.venv/bin:$PATH NFSU2_XBE=~/nfsu2/game/default.xbe \
+    NFSU2_GEN_DIR=$PWD/gen tools/regen.sh
+```
+
+Don't point the system `python3` at another version (for example with `update-alternatives`):
+Ubuntu's own tools, `apt` included, need its default Python.
+
+The result is `gen/`, 83 files and about 130 MB. Pack it and copy it to the Mac over a private
+route: a USB drive, your local network, or `scp` to a Mac you control:
+
+```sh
+tar czf ~/nfsu2-gen.tar.gz -C ~/nfsu2-ios gen
+scp ~/nfsu2-gen.tar.gz you@your-mac:~/
+```
+
+On the Mac, clone the same branch and commit, unpack it into the repo
+(`tar xzf ~/nfsu2-gen.tar.gz -C <repo>`), install the tools from step 1 except the Python venv, and
+continue from step 4. To check that the copy arrived intact, compare
+`cd gen && find . -type f | LC_ALL=C sort | xargs sha256sum` on Windows with the same command using
+`shasum -a 256` on the Mac. The game folder still has to reach the phone (step 7).
+
+> [!CAUTION]
+> **`gen/` is the game's own code, translated.** It is derived from EA's copyrighted executable,
+> like the disc itself. Never upload or share it: no GitHub (it's in `.gitignore`; keep it there),
+> no public cloud links, chat servers or file-sharing sites. Move it only between machines you
+> control, and delete copies you no longer need, including the tarball and anything left on a
+> rented cloud Mac when the rental ends. The same goes for a built app: it contains this code, so
+> everyone builds their own from their own disc.
 
 ## Known issues
 
