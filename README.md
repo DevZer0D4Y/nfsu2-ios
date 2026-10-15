@@ -2,7 +2,7 @@
 
 Unofficial native port of the original Xbox **Need for Speed: Underground 2**, based on [myUdav4iik/nfsu2-ios](https://github.com/myUdav4iik/nfsu2-ios) and [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw). Uses static recompilation and a native Metal renderer; no JIT is required.
 
-**[Download the IPA](dist/NFSU2-PAL-0.3-unsigned.ipa)** · [Changelog](CHANGELOG.md) · [Region support](docs/REGIONS.md) · [Build guide](docs/IOS_BUILD.md)
+**[Download the latest IPA](https://github.com/DevZer0D4Y/nfsu2-ios/releases/latest)** · [Changelog](CHANGELOG.md) · [Region support](docs/REGIONS.md) · [Build guide](docs/IOS_BUILD.md)
 
 This repository contains source and build tools. **Game discs, extracted game files, translated game-code output, signing credentials and music are not included.** Supply your own disc. The icon artwork is the supplied game cover; game names/artwork belong to their respective owners. This project is not affiliated with EA or Microsoft.
 
@@ -73,7 +73,7 @@ This repository contains source and build tools. **Game discs, extracted game fi
 
 ## Requirements and installation
 
-1. Download [NFSU2-PAL-0.3-unsigned.ipa](dist/NFSU2-PAL-0.3-unsigned.ipa) and [its SHA-256 checksum](dist/NFSU2-PAL-0.3-unsigned.ipa.sha256).
+1. Download [NFSU2-PAL-0.3-unsigned.ipa](https://github.com/DevZer0D4Y/nfsu2-ios/releases/download/v0.3/NFSU2-PAL-0.3-unsigned.ipa) and [its SHA-256 checksum](https://github.com/DevZer0D4Y/nfsu2-ios/releases/download/v0.3/NFSU2-PAL-0.3-unsigned.ipa.sha256) from [Releases](https://github.com/DevZer0D4Y/nfsu2-ios/releases/latest).
 2. Sign and install the IPA using your preferred sideloading tool, such as AltStore, SideStore, Sideloadly or ESign. The public IPA contains no developer signature or provisioning profile.
 3. Supply your own original Xbox **European PAL** disc image matching the [supported executable](docs/REGIONS.md). The current IPA does not run arbitrary regional executables.
 4. Launch **NFSU2** and select your ISO, or copy the extracted files into the directory below. Keep enough free space for both your ISO and its extracted contents during import; the verified European disc extracts to about 4.45 GB.
