@@ -1,112 +1,38 @@
-<div align="center">
+# NFSU2 for iPhone and iPad
 
-<img src="https://cdn2.steamgriddb.com/logo/4b29fa4efe4fb7bc667c7b301b74d52d.png" alt="Need for Speed: Underground 2" width="520">
+Unofficial native port of the original Xbox **Need for Speed: Underground 2**, based on [myUdav4iik/nfsu2-ios](https://github.com/myUdav4iik/nfsu2-ios) and [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw). Uses static recompilation and a native Metal renderer; no JIT is required.
 
-### On iPhone, iPad and Mac
+This repository contains source and build tools. **Game discs, extracted game files, translated game-code output, signing credentials and music are not included.** Supply your own disc. The icon artwork is the supplied game cover; game names/artwork belong to their respective owners. This project is not affiliated with EA or Microsoft.
 
-The original Xbox (NTSC-U) release of **Need for Speed: Underground 2**, recompiled to native code
-and running on Apple devices with a native **Metal** renderer. No emulator.
+## Playing
 
-![iOS](https://img.shields.io/badge/iOS-16%2B-000000?logo=apple&logoColor=white)
-![iPadOS](https://img.shields.io/badge/iPadOS-16%2B-000000?logo=apple&logoColor=white)
-![macOS](https://img.shields.io/badge/macOS-Apple%20silicon-000000?logo=apple&logoColor=white)
-![Metal](https://img.shields.io/badge/Metal-renderer-8A8A8A?logo=apple&logoColor=white)
+- Import your Xbox `.iso` or an extracted folder through the app's Files picker.
+- The read directory is **Files → On My iPhone/iPad → NFSU2 → game** (`Documents/game` in the app container). Put `default.xbe` and `NFSUNDER/` directly inside `game`, without another enclosing folder. **Edit → Game files → Extracted game directory** also shows the active read path and compiled region profile.
+- The ISO filesystem reader handles discs independently of region. **Executable compatibility is separate:** each build contains a translation for a specific executable. PAL Europe and NTSC-U profiles are documented in [Region support](docs/REGIONS.md). A PAL build cannot run an arbitrary NTSC/Japanese executable merely by accepting its ISO.
+- PAL controls automatically switch between Drive and Menu for gameplay and pause/options/frontend. A manual layout toggle remains available. **Edit** customizes the two layouts independently: button positions, size, opacity, visibility and mappings.
+- SDL-supported physical controllers take over from the touch pad; disconnecting restores touch input.
+- **Edit → My Music → Add MP3s from Files** imports your tracks. Use the **My Music** switch, **Next Track** and playlist volume. To hear only your playlist with engine sounds, lower the original soundtrack's Music volume in the game's audio options.
+- The image fills the screen. Presentation defaults to uncapped; iOS defaults to 4× internal width/height (16× the pixels). Actual performance depends on hardware, scene and heat.
 
-[Features](#features) · [Status](#status) · [Getting started](#getting-started) · [Controls](#controls) · [Credits](#credits)
+Saves stay in `Documents/game/UDATA` and `TDATA`. Import preserves existing saves and keeps the previous installation until the replacement succeeds. Backgrounding pauses the game, audio, custom music and GPU work.
 
-</div>
+## Settings
 
----
+Optional overrides go in `Documents/nfsu2x_env.txt`, one `KEY=VALUE` per line:
 
-> [!IMPORTANT]
-> **No game data is included, and none may be shared.** You need your own copy of the Xbox disc.
-> The game's code is translated on your own Mac from your own disc; the app you build is for you.
-
-This is a fork of [antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw), the static
-recompilation of NFSU2 for Nintendo Switch and Linux. This fork adds an Apple host: iPhone, iPad and
-macOS. The original README (Switch and Linux) is in
-[docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
-
-## Features
-
-- **Native Metal renderer** (iOS 17+ / macOS 14+), with Vulkan through MoltenVK as the fallback
-  (and on iOS 16)
-- **Touch controls** on iPhone and iPad: stick, gas and brake pedals, face buttons, haptics
-- **Controllers**: DualSense, Xbox and other MFi controllers; the touch controls hide while one is
-  connected
-- **Mac keyboard** as a controller when no pad is connected
-- **Game import in the app**: pick your extracted disc folder; the app checks it and copies it in
-- **Smooth movies** decoded with FFmpeg (VP6, LGPL, shipped as separate frameworks)
-- **Background pause**: leaving the app pauses the game, its sound and all GPU work
-- **Widescreen 16:9**, using the game's own wide mode
-- Saves stay with the game, in the app's `Documents/game/UDATA`
-
-## Status
-
-| Device | State |
+| Setting | Effect |
 |---|---|
-| iPhone 13 Pro (A15, iOS 27) | Movies, menus (60 fps), Quick Race and Career free-roam (30 fps, the game's own cap) |
-| Mac (M1) | The same; keyboard or controller |
-| iOS Simulator | Boots to the menus |
+| `RECOMP_GL_SCALE=4` | Internal render scale; 4 is the iOS default. Lower values reduce GPU work. |
+| `NFSU2_FPS_LIMIT=0` | Uncapped presentation; positive values up to 1000 set a ceiling. |
+| `NFSU2_SCREEN=fit` | Preserve aspect ratio instead of filling the screen. |
+| `NFSU2_AUTO_CONTROLS=0` | Use manual Menu/Drive selection. |
+| `NFSU2_TOUCH=2` | Keep touch graphics visible with a physical controller. |
+| `RECOMP_FPS_LOG=1` | Log FPS, GPU command timings, CPU, thermal and audio diagnostics. |
 
-Known issues:
+## Build and validation
 
-- In Career free-roam on the iPhone, radio speech can drop out between words (fine on the Mac).
-- The first time a new effect appears after installing, it can stutter briefly while its shader
-  compiles; later runs have it ready.
-- Not yet tested: long play sessions (heat), iPad.
+See [iOS build instructions](docs/IOS_BUILD.md) and [region profiles](docs/REGIONS.md). The default bundle ID is `com.devz.nfsu2`; override `NFSU2_IOS_BUNDLE_ID` and select your own signing team when building. Native VP6 movies use separately linked LGPL FFmpeg frameworks.
 
-The full development log, with measurements, is in [docs/IOS_PORT_LOG.md](docs/IOS_PORT_LOG.md).
+Source-level regressions are in `tests/apple_touch`, `tests/metal_bindings` and `tests/xiso`. They use synthetic fixtures; no retail disc or music is required. The Metal checks validate GPU pixels, encoder state, feedback snapshots and transform constants at native and 4× scale. CPU submission microbenchmarks do not establish an iPhone gameplay FPS gain.
 
-## Getting started
-
-You need an Apple-silicon Mac with Xcode, your own NFSU2 Xbox disc (NTSC-U) and, for the phone, an
-Apple ID signed in to Xcode. In short:
-
-1. Install the tools (Homebrew, Python with capstone).
-2. Extract your disc and translate the game's code to C on your Mac (`tools/regen.sh`).
-3. Build the libraries for iOS (`tools/build_ios_deps.sh`, `tools/build_ffmpeg_apple.sh`).
-4. Build and install the app from Xcode's command line.
-5. Copy your game folder to the phone and pick it in the app.
-
-Every command is in **[docs/IOS_BUILD.md](docs/IOS_BUILD.md)**, including the Mac version.
-
-## Controls
-
-**Touch** (no controller connected): left side of the screen is a floating stick; on the right are
-the pedals (gas, brake), A/B/X/Y, White/Black, Start and Back.
-
-**Mac keyboard** (no controller connected):
-
-| Keys | Does |
-|---|---|
-| W / S | gas / brake, reverse |
-| Arrow keys, A / D | steer; the arrows also move through menus |
-| Enter | confirm, Press START, pause |
-| Esc or Backspace | back |
-| Space / Left Shift | X / Y |
-| Q / E | White / Black |
-| Tab / P | Back / Start |
-
-The in-game controls screen shows what each Xbox button does.
-
-**Settings** go in `nfsu2x_env.txt` (on the phone: Files → NFSU2), one `KEY=VALUE` per line, for
-example `NFSU2_RENDERER=vulkan` (MoltenVK instead of Metal), `NFSU2_TOUCH=0` (no touch controls),
-`RECOMP_GL_SCALE=1.5` (sharper picture) or `RECOMP_FPS_LOG=1` (performance log). More in
-[docs/IOS_BUILD.md](docs/IOS_BUILD.md).
-
-## Credits
-
-- **[antoxa2584x/nfsu2-sw](https://github.com/antoxa2584x/nfsu2-sw)** by Anton Artemov: the NFSU2
-  recompilation for Switch and Linux that this fork builds on.
-- **[xboxrecomp](https://github.com/sp00nznet/xboxrecomp)** by sp00nz and contributors (MIT): the
-  static recompilation toolkit and runtime.
-- **[xemu](https://github.com/xemu-project/xemu)**: the Xbox audio processor code (LGPL-2.1).
-- **FFmpeg, SDL2, MoltenVK, glslang**: see [docs/APPLE_NOTICES.md](docs/APPLE_NOTICES.md) for every
-  library and its licence.
-
-<div align="center">
-<sub>Need for Speed and Underground are trademarks of Electronic Arts; Xbox is a trademark of
-Microsoft. This is an unofficial fan project, not affiliated with or endorsed by EA or Microsoft.
-You must own the game.</sub>
-</div>
+Preserve the licenses included in this repository and its vendored components.
