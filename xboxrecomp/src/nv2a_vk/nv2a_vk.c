@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include "../platform/apple_present.h"
+#endif
 /*
  * nv2a_vk.c -- a Vulkan 1.3 renderer for the pushbuffer executor.
  *
@@ -3355,6 +3358,9 @@ static void vk_flip(void)
     if (!ready())
         return;
     pend_flush();
+#if defined(__APPLE__)
+    xbox_apple_limit_frame();
+#endif
     s_frame++;
     if (s_inst_alt)
         s_inst_on = s_frame & 1;
@@ -3476,6 +3482,9 @@ static void vk_flip(void)
                     lw = lh * 16.0f / 9.0f;
                 scale = ww / lw < wh / lh ? ww / lw : wh / lh;
                 dw = (int)(lw * scale); dh = (int)(lh * scale);
+#if defined(__APPLE__)
+                if (xbox_apple_screen_fill()) { dw = (int)ww; dh = (int)wh; }
+#endif
                 dx = ((int)ww - dw) / 2; dy = ((int)wh - dh) / 2;
                 mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
